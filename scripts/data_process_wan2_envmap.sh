@@ -1,0 +1,12 @@
+python examples/wanvideo/train_wan_t2v.py \
+  --task data_process \
+  --dataset_path /ocean/projects/cis250002p/rju/datasets/haven/renders/vids \
+  --haven_root /ocean/projects/cis250002p/rju/datasets/haven \
+  --output_path ./models \
+  --text_encoder_path "models/Wan-AI/Wan2.1-T2V-1.3B/models_t5_umt5-xxl-enc-bf16.pth" \
+  --vae_path "models/Wan-AI/Wan2.1-T2V-1.3B/Wan2.1_VAE.pth" \
+  --tiled \
+  --num_frames 25 \
+  --height 256 \
+  --width 256 \
+  --dataloader_num_workers 4

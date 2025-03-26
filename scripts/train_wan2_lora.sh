@@ -1,0 +1,15 @@
+python examples/wanvideo/train_wan_t2v.py \
+  --task train \
+  --train_architecture lora \
+  --dataset_path data/DL3DV-10K-Samples \
+  --output_path ./models \
+  --dit_path "models/Wan-AI/Wan2.1-T2V-1.3B/diffusion_pytorch_model.safetensors" \
+  --steps_per_epoch 500 \
+  --max_epochs 10 \
+  --learning_rate 1e-4 \
+  --lora_rank 16 \
+  --lora_alpha 16 \
+  --lora_target_modules "q,k,v,o,ffn.0,ffn.2" \
+  --accumulate_grad_batches 1 \
+  --use_gradient_checkpointing \
+  --dataloader_num_workers 4
