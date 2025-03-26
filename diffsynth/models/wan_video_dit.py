@@ -49,12 +49,53 @@ def flash_attention(q: torch.Tensor, k: torch.Tensor, v: torch.Tensor, num_heads
         v = rearrange(v, "b s (n d) -> b n s d", n=num_heads)
         x = sageattn(q, k, v)
         x = rearrange(x, "b n s d -> b s (n d)", n=num_heads)
+    # else:
+    #     q = rearrange(q, "b s (n d) -> b n s d", n=num_heads)
+    #     k = rearrange(k, "b s (n d) -> b n s d", n=num_heads)
+    #     v = rearrange(v, "b s (n d) -> b n s d", n=num_heads)
+    #     x = F.scaled_dot_product_attention(q, k, v)
+    #     x = rearrange(x, "b n s d -> b s (n d)", n=num_heads)
+    
     else:
-        q = rearrange(q, "b s (n d) -> b n s d", n=num_heads)
-        k = rearrange(k, "b s (n d) -> b n s d", n=num_heads)
-        v = rearrange(v, "b s (n d) -> b n s d", n=num_heads)
-        x = F.scaled_dot_product_attention(q, k, v)
-        x = rearrange(x, "b n s d -> b s (n d)", n=num_heads)
+        from xformers.ops import memory_efficient_attention
+        from xformers.ops.fmha.attn_bias import BlockDiagonalMask
+        
+        dtype = torch.float16
+
+        # q = rearrange(q, "b s (n d) -> b n s d", n=num_heads)
+        # k = rearrange(k, "b s (n d) -> b n s d", n=num_heads)
+        # v = rearrange(v, "b s (n d) -> b n s d", n=num_heads)
+        
+        # q:              [B, Lq, Nq, C1].
+        # k:              [B, Lk, Nk, C1].
+        # v:              [B, Lk, Nk, C2]. Nq must be divisible by Nk.
+        q = rearrange(q, "b s (n d) -> b s n d", n=num_heads)
+        k = rearrange(k, "b s (n d) -> b s n d", n=num_heads)
+        v = rearrange(v, "b s (n d) -> b s n d", n=num_heads)
+        
+        q = q.to(dtype)
+        k = k.to(dtype)
+        v = v.to(dtype)
+                
+        b, lq, lk = q.size(0), q.size(1), k.size(1)
+                
+        bd_mask = BlockDiagonalMask.from_seqlens(
+            [lq] * b,
+            [lk] * b,
+            device=q.device
+        )
+
+        x = memory_efficient_attention(
+            q,
+            k,
+            v,
+            # attn_bias = bd_mask,
+            p = 0.0 # FIXME: dropout is not set yet
+        )
+        
+        # reshape (bs * seq_len, num_head, head_dim) -> (bs, seq_len, num_head * head_dim)
+        x = x.reshape(b, lq, -1)
+        
     return x
 
 
@@ -138,6 +179,17 @@ class SelfAttention(nn.Module):
         q = self.norm_q(self.q(x))
         k = self.norm_k(self.k(x))
         v = self.v(x)
+        
+        """
+        x = flash_attention(
+            q=rope_apply(q, freqs, self.num_heads),
+            k=rope_apply(k, freqs, self.num_heads),
+            v=v,
+            num_heads=self.num_heads
+        )
+        # x: (bs, seq_len, num_head * head_dim)
+        return self.o(x)
+        """
         q = rope_apply(q, freqs, self.num_heads)
         k = rope_apply(k, freqs, self.num_heads)
         x = self.attn(q, k, v)
@@ -200,21 +252,32 @@ class DiTBlock(nn.Module):
         self.self_attn = SelfAttention(dim, num_heads, eps)
         self.cross_attn = CrossAttention(
             dim, num_heads, eps, has_image_input=has_image_input)
+        
+        self.cross_attn_to_envmap = CrossAttention(
+            dim, num_heads, eps, has_image_input=True)
+        
         self.norm1 = nn.LayerNorm(dim, eps=eps, elementwise_affine=False)
         self.norm2 = nn.LayerNorm(dim, eps=eps, elementwise_affine=False)
         self.norm3 = nn.LayerNorm(dim, eps=eps)
+        self.norm4 = nn.LayerNorm(dim, eps=eps)
         self.ffn = nn.Sequential(nn.Linear(dim, ffn_dim), nn.GELU(
             approximate='tanh'), nn.Linear(ffn_dim, dim))
         self.modulation = nn.Parameter(torch.randn(1, 6, dim) / dim**0.5)
         self.gate = GateModule()
 
-    def forward(self, x, context, t_mod, freqs):
+    def forward(self, x, text_context, envmap_context, t_mod, freqs):
         # msa: multi-head self-attention  mlp: multi-layer perceptron
         shift_msa, scale_msa, gate_msa, shift_mlp, scale_mlp, gate_mlp = (
             self.modulation.to(dtype=t_mod.dtype, device=t_mod.device) + t_mod).chunk(6, dim=1)
         input_x = modulate(self.norm1(x), shift_msa, scale_msa)
-        x = self.gate(x, gate_msa, self.self_attn(input_x, freqs))
-        x = x + self.cross_attn(self.norm3(x), context)
+        x = x + gate_msa * self.self_attn(input_x, freqs)
+        
+        # cross-attention to text
+        x = x + self.cross_attn(self.norm3(x), text_context)
+        
+        # cross-attention to envmap
+        x = x + self.cross_attn_to_envmap(self.norm4(x), envmap_context)
+        
         input_x = modulate(self.norm2(x), shift_mlp, scale_mlp)
         x = self.gate(x, gate_mlp, self.ffn(input_x))
         return x
@@ -258,6 +321,7 @@ class WanModel(torch.nn.Module):
         ffn_dim: int,
         out_dim: int,
         text_dim: int,
+        envmap_dim: int,
         freq_dim: int,
         eps: float,
         patch_size: Tuple[int, int, int],
@@ -460,6 +524,7 @@ class WanModelStateDictConverter:
                 "ffn_dim": 8960,
                 "freq_dim": 256,
                 "text_dim": 4096,
+                "envmap_dim": 2048,
                 "out_dim": 16,
                 "num_heads": 12,
                 "num_layers": 30,
