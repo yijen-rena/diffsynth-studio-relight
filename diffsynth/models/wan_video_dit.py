@@ -242,7 +242,7 @@ class GateModule(nn.Module):
     def forward(self, x, gate, residual):
         return x + gate * residual
 
-class DiTBlock(nn.Module):
+class DiTBlockWithEnvmap(nn.Module):
     def __init__(self, has_image_input: bool, dim: int, num_heads: int, ffn_dim: int, eps: float = 1e-6):
         super().__init__()
         self.dim = dim
@@ -278,6 +278,35 @@ class DiTBlock(nn.Module):
         # cross-attention to envmap
         x = x + self.cross_attn_to_envmap(self.norm4(x), envmap_context)
         
+        input_x = modulate(self.norm2(x), shift_mlp, scale_mlp)
+        x = self.gate(x, gate_mlp, self.ffn(input_x))
+        return x
+    
+class DiTBlock(nn.Module):
+    def __init__(self, has_image_input: bool, dim: int, num_heads: int, ffn_dim: int, eps: float = 1e-6):
+        super().__init__()
+        self.dim = dim
+        self.num_heads = num_heads
+        self.ffn_dim = ffn_dim
+
+        self.self_attn = SelfAttention(dim, num_heads, eps)
+        self.cross_attn = CrossAttention(
+            dim, num_heads, eps, has_image_input=has_image_input)
+        self.norm1 = nn.LayerNorm(dim, eps=eps, elementwise_affine=False)
+        self.norm2 = nn.LayerNorm(dim, eps=eps, elementwise_affine=False)
+        self.norm3 = nn.LayerNorm(dim, eps=eps)
+        self.ffn = nn.Sequential(nn.Linear(dim, ffn_dim), nn.GELU(
+            approximate='tanh'), nn.Linear(ffn_dim, dim))
+        self.modulation = nn.Parameter(torch.randn(1, 6, dim) / dim**0.5)
+        self.gate = GateModule()
+
+    def forward(self, x, context, t_mod, freqs):
+        # msa: multi-head self-attention  mlp: multi-layer perceptron
+        shift_msa, scale_msa, gate_msa, shift_mlp, scale_mlp, gate_mlp = (
+            self.modulation.to(dtype=t_mod.dtype, device=t_mod.device) + t_mod).chunk(6, dim=1)
+        input_x = modulate(self.norm1(x), shift_msa, scale_msa)
+        x = self.gate(x, gate_msa, self.self_attn(input_x, freqs))
+        x = x + self.cross_attn(self.norm3(x), context)
         input_x = modulate(self.norm2(x), shift_mlp, scale_mlp)
         x = self.gate(x, gate_mlp, self.ffn(input_x))
         return x
@@ -321,7 +350,7 @@ class WanModel(torch.nn.Module):
         ffn_dim: int,
         out_dim: int,
         text_dim: int,
-        envmap_dim: int,
+        # envmap_dim: int,
         freq_dim: int,
         eps: float,
         patch_size: Tuple[int, int, int],
@@ -524,7 +553,7 @@ class WanModelStateDictConverter:
                 "ffn_dim": 8960,
                 "freq_dim": 256,
                 "text_dim": 4096,
-                "envmap_dim": 2048,
+                # "envmap_dim": 2048,
                 "out_dim": 16,
                 "num_heads": 12,
                 "num_layers": 30,

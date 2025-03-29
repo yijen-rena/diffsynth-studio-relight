@@ -1,4 +1,4 @@
-# torch>=2.0.0 # pip3 install torch torchvision torchaudio --index-url https://download.pytorch.org/whl/cu126
+# torch>=2.0.0 # xformers needs cuda 12.4 # pip install torch torchvision
 # torchvision
 cupy-cuda12x
 transformers==4.46.2
@@ -11,3 +11,4 @@ sentencepiece
 protobuf
 modelscope
 ftfy
+xformers==0.0.29.post2

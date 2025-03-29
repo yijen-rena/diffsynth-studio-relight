@@ -1,0 +1,15 @@
+python examples/train/stable_diffusion/train_sd_lora.py \
+  --pretrained_path models/stable_diffusion/models--stable-diffusion-v1-5--stable-diffusion-v1-5/snapshots/451f4fe16113bff5a5d2269ed5ad43b0592e9a14/v1-5-pruned-emaonly.safetensors \
+  --dataset_path data/dalle3_weird_animals \
+  --output_path ./models \
+  --max_epochs 1 \
+  --steps_per_epoch 500 \
+  --height 512 \
+  --width 512 \
+  --center_crop \
+  --precision "16-mixed" \
+  --learning_rate 1e-4 \
+  --lora_rank 4 \
+  --lora_alpha 4 \
+  --use_gradient_checkpointing \
+  --dataloader_num_workers 4

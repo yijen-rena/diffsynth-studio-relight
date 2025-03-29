@@ -11,6 +11,12 @@
 
 Document: https://diffsynth-studio.readthedocs.io/zh-cn/latest/index.html
 
+## Running on PSC
+
+```
+module load cuda/12.4
+```
+
 ## Introduction
 
 Welcome to the magic world of Diffusion models!

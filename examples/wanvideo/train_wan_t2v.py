@@ -500,7 +500,7 @@ def parse_args():
 def data_process(args):
     dataset = TextVideoDataset(
         args.dataset_path,
-        os.path.join(args.dataset_path, "metadata.csv"),
+        os.path.join(args.dataset_path, "train", "metadata.csv"),
         max_num_frames=args.num_frames,
         frame_interval=1,
         num_frames=args.num_frames,
@@ -533,7 +533,7 @@ def data_process(args):
 def train(args):
     dataset = TensorDataset(
         args.dataset_path,
-        os.path.join(args.dataset_path, "metadata.csv"),
+        os.path.join(args.dataset_path, "train", "metadata.csv"),
         steps_per_epoch=args.steps_per_epoch,
     )
     dataloader = torch.utils.data.DataLoader(

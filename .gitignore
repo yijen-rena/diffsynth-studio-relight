@@ -9,7 +9,6 @@ diffsynth/data/
 
 
 models/
-diffsynth/models/
 **/*.safetensors
 **/*.pt
 **/*.ckpt

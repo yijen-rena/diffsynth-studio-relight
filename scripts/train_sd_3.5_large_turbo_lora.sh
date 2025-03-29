@@ -1,4 +1,4 @@
-MODEL_PATH_ROOT=models/stable_diffusion_3.5_large/models--stabilityai--stable-diffusion-3.5-large/snapshots/ceddf0a7fdf2064ea28e2213e3b84e4afa170a0f
+MODEL_PATH_ROOT=models/stable_diffusion_3.5_large_turbo/models--stabilityai--stable-diffusion-3.5-large-turbo/snapshots/ec07796fc06b096cc56de9762974a28f4c632eda
 
 python examples/train/stable_diffusion_3/train_sd3_lora.py \
   --pretrained_path ${MODEL_PATH_ROOT}/text_encoders/clip_g.safetensors,${MODEL_PATH_ROOT}/text_encoders/clip_l.safetensors,${MODEL_PATH_ROOT}/text_encoders/t5xxl_fp16.safetensors,${MODEL_PATH_ROOT}/sd3.5_large.safetensors \

@@ -82,6 +82,53 @@ class SDImagePipeline(BasePipeline):
         prompt_emb = self.prompter.encode_prompt(prompt, clip_skip=clip_skip, device=self.device, positive=positive)
         return {"encoder_hidden_states": prompt_emb}
     
+    def encode_envir_map(self, num_frames, envir_map_path, camera_poses_path):
+        from diffusers import AutoencoderKLTemporalDecoder
+        
+        if isinstance(envir_map_path, list):
+            envir_map_path = envir_map_path[0]
+        
+        if isinstance(camera_poses_path, list):
+            camera_poses_path = camera_poses_path[0]
+        
+        envir_map_hdr = read_hdr(envir_map_path, return_type='np')
+        with open(camera_poses_path, 'r') as f:
+            camera_poses = json.load(f)
+            
+        cam2world = np.array(camera_poses['frame_0'])
+        
+        envir_map_remapped = env_map_to_cam_to_world_by_convention(envir_map_hdr, cam2world)
+        envir_map_ldr = reinhard_tonemap(envir_map_remapped)
+        envir_map_ldr_img = Image.fromarray((envir_map_ldr * 255).astype(np.uint8)).convert('RGB')
+        
+        vae = AutoencoderKLTemporalDecoder.from_pretrained( # not using self.vae because it's for video encoding
+            "stabilityai/stable-video-diffusion-img2vid",
+            subfolder="vae",
+            variant="fp16"
+        )
+        vae.requires_grad_(False)
+        vae.to(self.device, dtype=torch.float16)
+
+        envir_map_ldr = torch.from_numpy(envir_map_ldr).permute(2, 0, 1).unsqueeze(0).to(self.device, dtype=torch.float16)
+        envir_map_embeddings = vae.encode(envir_map_ldr).latent_dist.sample()
+        
+        vae.to("cpu")
+        
+        # downsample envmap_image_embedding by factor of 8
+        envir_map_embeddings = F.interpolate(
+            envir_map_embeddings,
+            size=(
+                envir_map_embeddings.shape[-2] // 8,
+                envir_map_embeddings.shape[-1] // 8
+            ),
+            mode='bilinear',
+            align_corners=False
+        )
+        # flatten and repeat envmap_image_embedding for each frame
+        envir_map_embeddings = envir_map_embeddings.flatten(start_dim=1) # [batch_size, 4 * H // 8 * W // 8]
+        envir_map_embeddings = envir_map_embeddings.repeat(num_frames, 1, 1)
+        
+        return {"y": envir_map_embeddings}
 
     def prepare_extra_input(self, latents=None):
         return {}
