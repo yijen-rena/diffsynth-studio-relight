@@ -5,13 +5,14 @@ from .base import BasePipeline
 import torch
 from tqdm import tqdm
 
+# from ..models.data_utils import read_hdr, env_map_to_cam_to_world_by_convention, reinhard_tonemap
 
 
 class SD3ImagePipeline(BasePipeline):
 
     def __init__(self, device="cuda", torch_dtype=torch.float16):
         super().__init__(device=device, torch_dtype=torch_dtype, height_division_factor=16, width_division_factor=16)
-        self.scheduler = FlowMatchScheduler()
+        self.scheduler = FlowMatchScheduler(num_inference_steps=20)
         self.prompter = SD3Prompter()
         # models
         self.text_encoder_1: SD3TextEncoder1 = None
@@ -65,7 +66,43 @@ class SD3ImagePipeline(BasePipeline):
         )
         return {"prompt_emb": prompt_emb, "pooled_prompt_emb": pooled_prompt_emb}
     
+    # def encode_envir_map(self, envir_map_path, camera_poses_path):
+    #     from diffusers import AutoencoderKLTemporalDecoder
+        
+    #     if isinstance(envir_map_path, list):
+    #         envir_map_path = envir_map_path[0]
+        
+    #     if isinstance(camera_poses_path, list):
+    #         camera_poses_path = camera_poses_path[0]
+        
+    #     envir_map_hdr = read_hdr(envir_map_path, return_type='np')
+    #     with open(camera_poses_path, 'r') as f:
+    #         camera_poses = json.load(f)
+            
+    #     cam2world = np.array(camera_poses['frame_0'])
+        
+    #     envir_map_remapped = env_map_to_cam_to_world_by_convention(envir_map_hdr, cam2world)
+    #     envir_map_ldr = reinhard_tonemap(envir_map_remapped)
+    #     envir_map_ldr_img = Image.fromarray((envir_map_ldr * 255).astype(np.uint8)).convert('RGB')
 
+    #     envir_map_ldr = torch.from_numpy(envir_map_ldr).permute(2, 0, 1).unsqueeze(0).to(self.device, dtype=torch.float16)
+    #     envir_map_embeddings = self.encode_image(envir_map_ldr)
+                
+    #     # downsample envmap_image_embedding by factor of 8
+    #     envir_map_embeddings = F.interpolate(
+    #         envir_map_embeddings,
+    #         size=(
+    #             envir_map_embeddings.shape[-2] // 8,
+    #             envir_map_embeddings.shape[-1] // 8
+    #         ),
+    #         mode='bilinear',
+    #         align_corners=False
+    #     )
+    #     # flatten and repeat envmap_image_embedding for each frame
+    #     envir_map_embeddings = envir_map_embeddings.flatten(start_dim=1) # [batch_size, 4 * H // 8 * W // 8]
+        
+    #     return {"envmap_emb": envir_map_embeddings}
+    
     def prepare_extra_input(self, latents=None):
         return {}
     
@@ -78,6 +115,8 @@ class SD3ImagePipeline(BasePipeline):
         masks=[],
         mask_scales=[],
         negative_prompt="",
+        envir_map_path=None,
+        camera_poses_path=None,
         cfg_scale=7.5,
         input_image=None,
         denoising_strength=1.0,
@@ -116,6 +155,10 @@ class SD3ImagePipeline(BasePipeline):
         prompt_emb_nega = self.encode_prompt(negative_prompt, positive=False, t5_sequence_length=t5_sequence_length)
         prompt_emb_locals = [self.encode_prompt(prompt_local, t5_sequence_length=t5_sequence_length) for prompt_local in local_prompts]
 
+        # Encode envir map
+        # self.load_models_to_device(['vae_encoder'])
+        # envir_map_embeddings = self.encode_envir_map(envir_map_path, camera_poses_path)
+        
         # Denoise
         self.load_models_to_device(['dit'])
         for progress_id, timestep in enumerate(progress_bar_cmd(self.scheduler.timesteps)):

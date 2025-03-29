@@ -3,7 +3,8 @@ from einops import rearrange
 from .svd_unet import TemporalTimesteps
 from .tiler import TileWorker
 
-
+from xformers.ops import memory_efficient_attention
+from xformers.ops.fmha.attn_bias import BlockDiagonalMask
 
 class RMSNorm(torch.nn.Module):
     def __init__(self, dim, eps, elementwise_affine=True):
@@ -140,7 +141,8 @@ class JointAttention(torch.nn.Module):
         k = torch.concat([ka, kb], dim=2)
         v = torch.concat([va, vb], dim=2)
 
-        hidden_states = torch.nn.functional.scaled_dot_product_attention(q, k, v)
+        # hidden_states = torch.nn.functional.scaled_dot_product_attention(q, k, v)
+        hidden_states = memory_efficient_attention(q, k, v)
         hidden_states = hidden_states.transpose(1, 2).reshape(batch_size, -1, self.num_heads * self.head_dim)
         hidden_states = hidden_states.to(q.dtype)
         hidden_states_a, hidden_states_b = hidden_states[:, :hidden_states_a.shape[1]], hidden_states[:, hidden_states_a.shape[1]:]
@@ -186,7 +188,8 @@ class SingleAttention(torch.nn.Module):
         batch_size = hidden_states_a.shape[0]
         q, k, v = self.process_qkv(hidden_states_a, self.a_to_qkv, self.norm_q_a, self.norm_k_a)
 
-        hidden_states = torch.nn.functional.scaled_dot_product_attention(q, k, v)
+        # hidden_states = torch.nn.functional.scaled_dot_product_attention(q, k, v)
+        hidden_states = memory_efficient_attention(q, k, v)
         hidden_states = hidden_states.transpose(1, 2).reshape(batch_size, -1, self.num_heads * self.head_dim)
         hidden_states = hidden_states.to(q.dtype)
         hidden_states = self.a_to_out(hidden_states)

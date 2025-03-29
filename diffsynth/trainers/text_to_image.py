@@ -34,7 +34,17 @@ class LightningModelForT2ILoRA(pl.LightningModule):
         self.pipe.denoising_model().train()
 
     
-    def add_lora_to_model(self, model, lora_rank=4, lora_alpha=4, lora_target_modules="to_q,to_k,to_v,to_out", init_lora_weights="gaussian", pretrained_lora_path=None, state_dict_converter=None):
+    def add_lora_to_model(
+        self,
+        model,
+        lora_rank=4,
+        lora_alpha=4,
+        lora_target_modules="to_q,to_k,to_v,to_out",
+        init_lora_weights="gaussian",
+        pretrained_lora_path=None,
+        state_dict_converter=None,
+        lora_weight_precision=torch.float32
+    ):
         # Add LoRA to UNet
         self.lora_alpha = lora_alpha
         if init_lora_weights == "kaiming":
@@ -47,10 +57,13 @@ class LightningModelForT2ILoRA(pl.LightningModule):
             target_modules=lora_target_modules.split(","),
         )
         model = inject_adapter_in_model(lora_config, model)
-        for param in model.parameters():
+
+        # for param in model.parameters():
+        for name, param in model.named_parameters():
             # Upcast LoRA parameters into fp32
             if param.requires_grad:
-                param.data = param.to(torch.float32)
+                print(name)
+                param.data = param.to(lora_weight_precision)
 
         # Lora pretrained lora weights
         if pretrained_lora_path is not None:
@@ -98,6 +111,14 @@ class LightningModelForT2ILoRA(pl.LightningModule):
     def configure_optimizers(self):
         trainable_modules = filter(lambda p: p.requires_grad, self.pipe.denoising_model().parameters())
         optimizer = torch.optim.AdamW(trainable_modules, lr=self.learning_rate)
+    
+        # import bitsandbytes as bnb
+        # optimizer = bnb.optim.Adam8bit(
+        #     trainable_modules,
+        #     lr=self.learning_rate,
+        #     optim_bits=8,
+        #     is_paged=True,
+        # )
         return optimizer
     
 
@@ -115,6 +136,28 @@ class LightningModelForT2ILoRA(pl.LightningModule):
         checkpoint.update(lora_state_dict)
 
 
+class ValidationImageCallback(pl.Callback):
+    def __init__(self, validation_prompts, cfg_scale=7.5):
+        super().__init__()
+        self.validation_prompts = validation_prompts
+        self.cfg_scale = cfg_scale
+    
+    def on_train_epoch_end(self, trainer, pl_module):
+        logger = trainer.logger
+        
+        with torch.no_grad():
+            for prompt in self.validation_prompts:
+                image = pl_module.pipe(
+                    prompt=prompt,
+                    cfg_scale=self.cfg_scale,
+                )
+                
+                caption = f"Epoch {trainer.current_epoch}: {prompt}"
+                logger.experiment.log({
+                    f"validation_images/{prompt}": [wandb.Image(image, caption=caption)]
+                })
+                
+        pl_module.pipe.scheduler.set_timesteps(1000, training=True)
 
 def add_general_parsers(parser):
     parser.add_argument(
@@ -261,10 +304,24 @@ def add_general_parsers(parser):
         default=None,
         help="SwanLab mode (cloud or local).",
     )
+    parser.add_argument(
+        "--use_wandb",
+        default=False,
+        action="store_true",
+        help="Whether to use WandB logger.",
+    )
+    parser.add_argument(
+        "--validation_prompts",
+        type=str,
+        nargs="+",
+        default=["an old-fashioned bow"],
+        help="Validation prompts. Required if use_wandb is True.",
+    )
+    
     return parser
 
 
-def launch_training_task(model, args):
+def launch_training_task(model, args, resume_from_checkpoint=None):
     # dataset and data loader
     dataset = TextImageDataset(
         args.dataset_path,
@@ -293,8 +350,31 @@ def launch_training_task(model, args):
             logdir=os.path.join(args.output_path, "swanlog"),
         )
         logger = [swanlab_logger]
+    elif args.use_wandb:
+        import wandb
+        import datetime
+        from pytorch_lightning.loggers import WandbLogger
+        
+        os.environ["WANDB_DIR"] = args.output_path
+        wandb_logger = WandbLogger(
+            project="diffsynth_studio-relight",
+            name=f"{datetime.datetime.now().strftime('%Y%m%d_%H%M%S')}",
+            config=vars(args),
+            save_dir=args.output_path,
+        )
+        logger = [wandb_logger]
     else:
         logger = None
+        
+    callbacks = [pl.pytorch.callbacks.ModelCheckpoint(save_top_k=-1)]
+    
+    if args.use_wandb:
+        validation_callback = ValidationImageCallback(
+            args.validation_prompts,
+            cfg_scale=7.5
+        )
+        callbacks.append(validation_callback)
+    
     trainer = pl.Trainer(
         max_epochs=args.max_epochs,
         accelerator="gpu",
@@ -303,10 +383,13 @@ def launch_training_task(model, args):
         strategy=args.training_strategy,
         default_root_dir=args.output_path,
         accumulate_grad_batches=args.accumulate_grad_batches,
-        callbacks=[pl.pytorch.callbacks.ModelCheckpoint(save_top_k=-1)],
+        callbacks=callbacks,
         logger=logger,
     )
-    trainer.fit(model=model, train_dataloaders=train_loader)
+    if resume_from_checkpoint is not None:
+        trainer.fit(model=model, train_dataloaders=train_loader, ckpt_path=resume_from_checkpoint)
+    else:
+        trainer.fit(model=model, train_dataloaders=train_loader)
 
     # Upload models
     if args.modelscope_model_id is not None and args.modelscope_access_token is not None:
