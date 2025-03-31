@@ -16,9 +16,68 @@ import random
 import shutil
 import json
 
-# from kornia import create_meshgrid
+from torch.utils.data import Dataset
+from kornia import create_meshgrid
+import imageio
+import math
 
 import pdb
+
+ENV_MAP_PATH = "/ocean/projects/cis240022p/ylitman/VSCode/RelightingDiffusion/data/fullres_light_probes"
+
+def fovx_to_fovy(fov_x, aspect_ratio):
+    fov_x_rad = math.radians(fov_x)
+    fov_y_rad = 2 * math.atan(math.tan(fov_x_rad / 2) * aspect_ratio)
+    fov_y = math.degrees(fov_y_rad)
+    return fov_y
+
+def perspective(fovy, aspect, near, far):
+    fovy_rad = math.radians(fovy)
+    f = 1.0 / math.tan(fovy_rad / 2.0)
+    result = np.zeros((4, 4), dtype=np.float32)
+    result[0, 0] = f / aspect
+    result[1, 1] = f
+    result[2, 2] = (far + near) / (near - far)
+    result[2, 3] = (2.0 * far * near) / (near - far)
+    result[3, 2] = -1.0
+    result = torch.from_numpy(result)
+    return result
+
+def rotate_x(angle):
+    if not isinstance(angle, torch.Tensor):
+        angle = torch.tensor(angle, dtype=torch.float32)
+    
+    device = angle.device
+
+    cos_theta = torch.cos(angle)
+    sin_theta = torch.sin(angle)
+
+    matrix = torch.eye(4, dtype=torch.float32, device=device)
+    
+    matrix[1, 1] = cos_theta
+    matrix[1, 2] = -sin_theta
+    matrix[2, 1] = sin_theta
+    matrix[2, 2] = cos_theta
+    
+    return matrix
+
+def _load_img(path):
+    files = glob(path + '.*')
+    assert len(files) > 0, "Tried to find image file for: %s, but found 0 files" % (path)
+    img = imageio.imread(files[0])
+    if img.dtype != np.float32: # LDR image
+        img = torch.tensor(img / 255, dtype=torch.float32)
+        # img[..., 0:3] = util.srgb_to_rgb(img[..., 0:3])
+    else:
+        img = torch.tensor(img, dtype=torch.float32)
+    return img
+
+def rotate_image_fast(image, degrees):
+    H, W, C = image.shape
+    degrees = degrees % 360  # Ensure degrees is within 360
+    pixel_loc = round(degrees * W / 360)  # Calculate the pixel location to rotate
+    image = np.hstack((image[:, -pixel_loc:, :], image[:, :-pixel_loc, :]))
+    return image
 
 def generate_plucker_rays(T, shape, fov = (35, 35), sensor_size=(1.0, 1.0)):
     """
@@ -75,7 +134,7 @@ def generate_plucker_rays(T, shape, fov = (35, 35), sensor_size=(1.0, 1.0)):
     # origins = np.tile(t[:, np.newaxis, np.newaxis], (1, H, W))  # Shape: (3, H, W)
     return plucker_rays
 
-def generate_directional_embeddings(shape=(256, 256), world2cam=None, normalize=True):
+def generate_directional_embeddings(shape, world2cam=None, normalize=True):
     height, width = shape
 
     u = np.linspace(0, 1, width, endpoint=False)
@@ -132,11 +191,14 @@ def read_hdr(path, return_type='np'):
     Returns:
         numpy.ndarray: Loaded (float) HDR map with RGB channels in order.
     """
+    if not path.endswith('.png'):
+        path = path + '.png'
+        
     try:
         with open(path, 'rb') as h:
             buffer_ = np.frombuffer(h.read(), np.uint8)
         bgr = cv2.imdecode(buffer_, cv2.IMREAD_UNCHANGED)
-        rgb = cv2.cvtColor(bgr, cv2.COLOR_BGR2RGB) # (1024, 2048, 3)
+        rgb = cv2.cvtColor(bgr, cv2.COLOR_BGR2RGB)
         
     except Exception as e:
         print(f"Error reading HDR file {path}: {e}")
@@ -511,10 +573,7 @@ class DatasetNERFMultiRelight(Dataset):
                 except Exception as e:
                     print(e)
                     env = imageio.imread(os.path.join("/ocean/projects/cis240022p/ylitman/VSCode/RelightingDiffusion/data/fullres_light_probes", cfg['frames'][idx][env_idx]['env']))[..., :3]
-                    
 
-                # print("init", env.min(), env.max())
-                # env_norm = (env - np.min(env)) / (np.max(env) - np.min(env))
                 if "rotation" in cfg['frames'][idx][env_idx]:
                     if cfg['frames'][idx][env_idx]["rotation"] > 0:
                         env = rotate_image_fast(env, cfg['frames'][idx][env_idx]["rotation"])
@@ -528,11 +587,7 @@ class DatasetNERFMultiRelight(Dataset):
 
                 env_darker = self.env_transform(env_darker)
                 env_brighter = self.env_transform(env_brighter)
-                # d_embeds = torch.tensor(generate_directional_embeddings(env.shape[:2]))
-                # mask = orm[..., 3:]
-                # img = img[..., :3] * mask
-                # albedo = albedo[..., :3] * mask
-                # orm = orm[..., :3] * mask
+
                 mask = img[3:, ...]
                 img = img[:3, ...] * mask
                 albedo = albedo[:3, ...] * mask
@@ -602,21 +657,14 @@ class DatasetNERFMultiRelight(Dataset):
         img, albedo, orm, mask, mvp, envs_darker, envs_brighter, dir_embeds, pluckers = self._parse_frame(self.cfg, itr % self.n_objs)
 
         return {
-            # 'mv' : mv,
             'T' : mvp,
-            # 'campos' : campos,
+            'campos' : campos,
             'resolution' : [self.args.resolution, self.args.resolution],
             'spp' : 16,
             'img' : img,
-            'albedo' : albedo,
-            'orm' : orm,
             'mask' : mask,
             'dir_embeds' : dir_embeds,
-            'pluckers' : pluckers,
-            # 'envs' : envs
-            'envs_darker' : envs_darker,
-            'envs_brighter' : envs_brighter,
-            # 'envmap' : envmap
+            'envmap' : envmap
         }
 
 
@@ -658,3 +706,136 @@ class DatasetNERFMultiRelight(Dataset):
 
         return out_batch
 
+
+class DatasetTextAndEnvmapToImage(Dataset):
+    # def __init__(self, dataset_path, steps_per_epoch=10000, height=1024, width=1024, center_crop=True, random_flip=False):
+    def __init__(self, config_path, args, examples=None):
+        self.examples = examples
+        self.base_dir = os.path.dirname(config_path)
+        self.args = args
+        self.steps_per_epoch = args.steps_per_epoch
+        self.height = args.height
+        self.width = args.width
+        
+        # metadata = pd.read_csv(os.path.join(self.base_dir, "metadata.csv"))
+        # self.text = metadata["text"].to_list()
+        
+        if "transforms_test" in config_path:
+            self.is_test = True
+        else:
+            self.is_test = False
+        
+        # Load config / transforms
+        self.config = json.load(open(config_path, 'r'))
+        # frames[i][j].keys() = ['env', 'rotation', 'flip', 'scale', 'views']
+        # frames[i][j]['views'][k].keys() = ['transform_matrix', 'file_path', 'file_path_albedo', 'file_path_normal', 'file_path_orm', 'file_path_depth']
+        # len(frames[i][j]['views'][k]) = 8
+        # frames[i][j]['views'][k]['file_path'] = f"{view_id}_{same_envmap}.png"
+        
+        frames = self.config['frames']
+        
+        self.text = [""] * len(frames)
+        
+        self.n_objs = len(frames)
+        self.n_envmaps = len(frames[0])
+        self.n_views = len(frames[0][0]["views"])
+        self.k_views = 4
+        if self.k_views > self.n_views:
+            self.k_views = self.n_views
+
+        # Determine resolution & aspect ratio
+        self.data_resolution = imageio.imread(os.path.join(self.base_dir, frames[0][0]["views"][0]['file_path'] + ".png")).shape[0:2]
+        self.data_resolution = (self.data_resolution[1], self.data_resolution[0])
+        self.aspect = self.data_resolution[1] / self.data_resolution[0]
+
+        # Camera parameters
+        self.fovx   = self.config['camera_angle_x']
+        self.fovy   = fovx_to_fovy(self.fovx, self.aspect)
+        self.proj   = perspective(self.fovy, self.aspect, 0.1, 1000.0)
+
+        self.dir_embeds = torch.tensor(generate_directional_embeddings(
+                                        shape=self.data_resolution,
+                                        world2cam=None, normalize=True),
+                                       dtype=torch.float32
+                                       ).permute(2, 0, 1)
+        
+        print(f"DatasetTextAndEnvmapToImage: loading {self.n_objs} objects with shape {self.data_resolution}")
+
+
+    def _parse_frame(self, config, idx, cam_near_far=[0.1, 1000.0]):
+        imgs, envs, dir_embeds, mvps = [], [], [], []
+        
+        frames = self.config['frames']
+        frame = frames[idx]
+
+        if self.is_test:
+            env_idx = 0
+        else:
+            env_idx = np.random.randint(len(frame))
+        
+        obj_views = frame[env_idx]['views']
+        view_idx = np.random.randint(len(obj_views))
+
+        # Load image
+        view = obj_views[view_idx]
+        img = read_hdr(os.path.join(self.base_dir, view['file_path']), return_type='torch').permute(2, 0, 1)
+        
+        # Camera parameters
+        frame_transform = torch.tensor(view['transform_matrix'], dtype=torch.float32)
+        mv = torch.linalg.inv(frame_transform)
+        mv = mv @ rotate_x(-np.pi / 2)
+        mvp = self.proj @ mv
+        t, r = frame_transform[:3, 3], torch.linalg.norm(frame_transform[:3, 3])
+        theta, phi = torch.arccos(t[2] / r), torch.arctan2(t[1], t[0])
+        mvp = torch.tensor([theta, torch.sin(phi), torch.cos(phi), r])
+
+        # Load envmap
+        try:
+            env = imageio.imread(os.path.join(self.args.envmap_path, frame[env_idx]['env']))[..., :3]
+            if "scale" in frame[env_idx]:
+                scale = frame[env_idx]["scale"]
+            elif ".exr" in frame[env_idx]["env"]:
+                scale = 150
+            else:
+                scale = 1
+            env = env * scale
+        except Exception as e:
+            print(e)
+            env = imageio.imread(os.path.join(ENV_MAP_PATH, frame[env_idx]['env']))[..., :3]
+            
+        # Transformations
+        if "rotation" in frame[env_idx]:
+            if frame[env_idx]["rotation"] > 0:
+                env = rotate_image_fast(env, frame[env_idx]["rotation"])
+        
+        if "flip" in frame[env_idx]:
+            if frame[env_idx]["flip"]:
+                env = env[..., ::-1, :]
+                
+        env = env_map_to_cam_to_world_by_convention(env, torch.linalg.inv(mv).numpy())
+        env = torch.from_numpy(env).permute(2, 0, 1)
+        env = env.float() / 255.0
+        env = env.half()
+
+        # [b, v, c, h, w]
+        # imgs = imgs.unsqueeze(0).repeat(self.args.batch_size, 1, 1, 1, 1)
+        # mvps = mvps.unsqueeze(0).repeat(self.args.batch_size, 1, 1, 1, 1)
+        # envs = envs.unsqueeze(0).repeat(self.args.batch_size, 1, 1, 1, 1)
+        # dir_embeds = dir_embeds.unsqueeze(0).repeat(self.args.batch_size, 1, 1, 1, 1)
+        return img, mvp, env, self.dir_embeds
+
+    def __len__(self):
+        # return self.n_objs if self.examples is None else self.examples
+        return self.steps_per_epoch
+
+    def __getitem__(self, itr):
+        imgs, mvps, envs, dir_embeds = self._parse_frame(self.config, itr % self.n_objs)
+
+        return {
+            'text' : self.text[itr % self.n_objs],
+            'image' : imgs,
+            'envmap' : envs,
+            'dir_embeds' : dir_embeds,
+            'T' : mvps,
+            'resolution' : (self.width, self.height),
+        }
