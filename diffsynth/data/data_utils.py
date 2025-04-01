@@ -817,11 +817,6 @@ class DatasetTextAndEnvmapToImage(Dataset):
         env = env.float() / 255.0
         env = env.half()
 
-        # [b, v, c, h, w]
-        # imgs = imgs.unsqueeze(0).repeat(self.args.batch_size, 1, 1, 1, 1)
-        # mvps = mvps.unsqueeze(0).repeat(self.args.batch_size, 1, 1, 1, 1)
-        # envs = envs.unsqueeze(0).repeat(self.args.batch_size, 1, 1, 1, 1)
-        # dir_embeds = dir_embeds.unsqueeze(0).repeat(self.args.batch_size, 1, 1, 1, 1)
         return img, mvp, env, self.dir_embeds
 
     def __len__(self):

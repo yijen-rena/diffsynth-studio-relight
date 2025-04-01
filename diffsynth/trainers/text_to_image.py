@@ -2,10 +2,11 @@ import lightning as pl
 from peft import LoraConfig, inject_adapter_in_model
 import torch, os
 from ..data.simple_text_image import TextImageDataset
+from ..data.data_utils import DatasetTextAndEnvmapToImage, read_hdr
 from modelscope.hub.api import HubApi
 from ..models.utils import load_state_dict
 
-
+import wandb
 
 class LightningModelForT2ILoRA(pl.LightningModule):
     def __init__(
@@ -31,7 +32,7 @@ class LightningModelForT2ILoRA(pl.LightningModule):
         # Freeze parameters
         self.pipe.requires_grad_(False)
         self.pipe.eval()
-        self.pipe.denoising_model().train()
+        # self.pipe.denoising_model().train()
 
     
     def add_lora_to_model(
@@ -77,13 +78,45 @@ class LightningModelForT2ILoRA(pl.LightningModule):
             print(f"{num_updated_keys} parameters are loaded from {pretrained_lora_path}. {num_unexpected_keys} parameters are unexpected.")
 
 
+    # def training_step(self, batch, batch_idx):
+    #     # Data
+    #     text, image = batch["text"], batch["image"]
+
+    #     # Prepare input parameters
+    #     self.pipe.device = self.device
+    #     prompt_emb = self.pipe.encode_prompt(text, positive=True)
+    #     if "latents" in batch:
+    #         latents = batch["latents"].to(dtype=self.pipe.torch_dtype, device=self.device)
+    #     else:
+    #         latents = self.pipe.vae_encoder(image.to(dtype=self.pipe.torch_dtype, device=self.device))
+    #     noise = torch.randn_like(latents)
+    #     timestep_id = torch.randint(0, self.pipe.scheduler.num_train_timesteps, (1,))
+    #     timestep = self.pipe.scheduler.timesteps[timestep_id].to(self.device)
+    #     extra_input = self.pipe.prepare_extra_input(latents)
+    #     noisy_latents = self.pipe.scheduler.add_noise(latents, noise, timestep)
+    #     training_target = self.pipe.scheduler.training_target(latents, noise, timestep)
+
+    #     # Compute loss
+    #     noise_pred = self.pipe.denoising_model()(
+    #         noisy_latents, timestep=timestep, **prompt_emb, **extra_input,
+    #         use_gradient_checkpointing=self.use_gradient_checkpointing
+    #     )
+    #     loss = torch.nn.functional.mse_loss(noise_pred.float(), training_target.float())
+    #     loss = loss * self.pipe.scheduler.training_weight(timestep)
+
+    #     # Record log
+    #     self.log("train_loss", loss, prog_bar=True)
+    #     # self.log("grad_norm", torch.norm(torch.stack([torch.norm(p.grad) for p in self.pipe.denoising_model().parameters() if p.grad is not None]), dim=0), prog_bar=True)
+    #     return loss
+    
     def training_step(self, batch, batch_idx):
         # Data
-        text, image = batch["text"], batch["image"]
+        text, image, envmap, dir_embeds, T = batch["text"], batch["image"], batch["envmap"], batch["dir_embeds"], batch["T"]
 
         # Prepare input parameters
         self.pipe.device = self.device
-        prompt_emb = self.pipe.encode_prompt(text, positive=True)
+        prompt_emb = self.pipe.encode_prompt(text, positive=True) # [1, 154, 4096], [1, 2048]
+        envmap_emb = self.pipe.encode_envir_map(envmap.to(dtype=self.pipe.torch_dtype, device=self.device))
         if "latents" in batch:
             latents = batch["latents"].to(dtype=self.pipe.torch_dtype, device=self.device)
         else:
@@ -97,7 +130,7 @@ class LightningModelForT2ILoRA(pl.LightningModule):
 
         # Compute loss
         noise_pred = self.pipe.denoising_model()(
-            noisy_latents, timestep=timestep, **prompt_emb, **extra_input,
+            noisy_latents, timestep=timestep, **prompt_emb, **extra_input, **envmap_emb,
             use_gradient_checkpointing=self.use_gradient_checkpointing
         )
         loss = torch.nn.functional.mse_loss(noise_pred.float(), training_target.float())
@@ -105,6 +138,7 @@ class LightningModelForT2ILoRA(pl.LightningModule):
 
         # Record log
         self.log("train_loss", loss, prog_bar=True)
+        # self.log("grad_norm", torch.norm(torch.stack([torch.norm(p.grad) for p in self.pipe.denoising_model().parameters() if p.grad is not None]), dim=0), prog_bar=True)
         return loss
 
 
@@ -147,6 +181,7 @@ class ValidationImageCallback(pl.Callback):
         
         with torch.no_grad():
             for prompt in self.validation_prompts:
+                envmap = Image.open(self.envmap_path)
                 image = pl_module.pipe(
                     prompt=prompt,
                     cfg_scale=self.cfg_scale,
@@ -166,6 +201,20 @@ def add_general_parsers(parser):
         default=None,
         required=True,
         help="The path of the Dataset.",
+    )
+    parser.add_argument(
+        "--dataset_config_path",
+        type=str,
+        default=None,
+        required=True,
+        help="The path of the Dataset config.",
+    )
+    parser.add_argument(
+        "--envmap_path",
+        type=str,
+        default=None,
+        required=True,
+        help="The path to environment maps.",
     )
     parser.add_argument(
         "--output_path",
@@ -323,13 +372,17 @@ def add_general_parsers(parser):
 
 def launch_training_task(model, args, resume_from_checkpoint=None):
     # dataset and data loader
-    dataset = TextImageDataset(
-        args.dataset_path,
-        steps_per_epoch=args.steps_per_epoch * args.batch_size,
-        height=args.height,
-        width=args.width,
-        center_crop=args.center_crop,
-        random_flip=args.random_flip
+    # dataset = TextImageDataset(
+    #     args.dataset_path,
+    #     steps_per_epoch=args.steps_per_epoch * args.batch_size,
+    #     height=args.height,
+    #     width=args.width,
+    #     center_crop=args.center_crop,
+    #     random_flip=args.random_flip
+    # )
+    dataset = DatasetTextAndEnvmapToImage(
+        args.dataset_config_path,
+        args
     )
     train_loader = torch.utils.data.DataLoader(
         dataset,
@@ -351,7 +404,6 @@ def launch_training_task(model, args, resume_from_checkpoint=None):
         )
         logger = [swanlab_logger]
     elif args.use_wandb:
-        import wandb
         import datetime
         from pytorch_lightning.loggers import WandbLogger
         

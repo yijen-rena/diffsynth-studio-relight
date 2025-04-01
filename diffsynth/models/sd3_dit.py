@@ -1,8 +1,10 @@
 import torch
+import torch.nn as nn
 from einops import rearrange
 from .svd_unet import TemporalTimesteps
 from .tiler import TileWorker
 
+import xformers
 from xformers.ops import memory_efficient_attention
 from xformers.ops.fmha.attn_bias import BlockDiagonalMask
 
@@ -92,6 +94,79 @@ class AdaLayerNorm(torch.nn.Module):
             x = self.norm(x) * (1 + scale_msa) + shift_msa
             return x, gate_msa, shift_mlp, scale_mlp, gate_mlp
 
+def multihead_memory_efficient_attention(q: torch.Tensor, k: torch.Tensor, v: torch.Tensor, num_heads: int, compatibility_mode=False):
+    dtype = torch.float16
+
+    q = rearrange(q, "b s (n d) -> b s n d", n=num_heads).to(dtype)
+    k = rearrange(k, "b s (n d) -> b s n d", n=num_heads).to(dtype)
+    v = rearrange(v, "b s (n d) -> b s n d", n=num_heads).to(dtype)
+            
+    b, lq, lk = q.size(0), q.size(1), k.size(1)
+            
+    bd_mask = BlockDiagonalMask.from_seqlens(
+        [lq] * b,
+        [lk] * b,
+        device=q.device
+    )
+
+    x = xformers.ops.memory_efficient_attention(
+        q,
+        k,
+        v,
+        # attn_bias = bd_mask,
+        p = 0.0 # FIXME: dropout is not set yet
+    )
+    x = x.reshape(b, lq, -1)
+    return x
+
+class AttentionModule(nn.Module):
+    def __init__(self, num_heads):
+        super().__init__()
+        self.num_heads = num_heads
+        
+    def forward(self, q, k, v):
+        x = multihead_memory_efficient_attention(q=q, k=k, v=v, num_heads=self.num_heads)
+        return x
+
+class CrossAttention(nn.Module):
+    def __init__(self, dim: int, num_heads: int, eps: float = 1e-6, has_image_input: bool = False, image_emb_dim: int = 256):
+        super().__init__()
+        self.dim = dim
+        self.num_heads = num_heads
+        self.head_dim = dim // num_heads
+        self.image_emb_dim = image_emb_dim
+        
+        self.q = nn.Linear(dim, dim)
+        self.k = nn.Linear(dim, dim)
+        self.v = nn.Linear(dim, dim)
+        self.o = nn.Linear(dim, dim)
+        self.norm_q = RMSNorm(dim, eps=eps)
+        self.norm_k = RMSNorm(dim, eps=eps)
+        self.has_image_input = has_image_input
+        if has_image_input:
+            self.k_img = nn.Linear(dim, dim)
+            self.v_img = nn.Linear(dim, dim)
+            self.norm_k_img = RMSNorm(dim, eps=eps)
+            
+        self.attn = AttentionModule(self.num_heads)
+
+    def forward(self, x: torch.Tensor, y: torch.Tensor):
+        if self.has_image_input:
+            img = y[:, :self.image_emb_dim + 1]
+            ctx = y[:, self.image_emb_dim + 1:]
+        else:
+            ctx = y
+        q = self.norm_q(self.q(x))
+        k = self.norm_k(self.k(ctx))
+        v = self.v(ctx)
+        x = self.attn(q, k, v)
+        if self.has_image_input:
+            k_img = self.norm_k_img(self.k_img(img))
+            v_img = self.v_img(img)
+            y = multihead_memory_efficient_attention(q, k_img, v_img, num_heads=self.num_heads)
+            x = x + y
+        return self.o(x)
+
 
 
 class JointAttention(torch.nn.Module):
@@ -142,7 +217,9 @@ class JointAttention(torch.nn.Module):
         v = torch.concat([va, vb], dim=2)
 
         # hidden_states = torch.nn.functional.scaled_dot_product_attention(q, k, v)
-        hidden_states = memory_efficient_attention(q, k, v)
+        k = k.to(q.dtype)
+        v = v.to(q.dtype)
+        hidden_states = xformers.ops.memory_efficient_attention(q, k, v)
         hidden_states = hidden_states.transpose(1, 2).reshape(batch_size, -1, self.num_heads * self.head_dim)
         hidden_states = hidden_states.to(q.dtype)
         hidden_states_a, hidden_states_b = hidden_states[:, :hidden_states_a.shape[1]], hidden_states[:, hidden_states_a.shape[1]:]
@@ -189,7 +266,9 @@ class SingleAttention(torch.nn.Module):
         q, k, v = self.process_qkv(hidden_states_a, self.a_to_qkv, self.norm_q_a, self.norm_k_a)
 
         # hidden_states = torch.nn.functional.scaled_dot_product_attention(q, k, v)
-        hidden_states = memory_efficient_attention(q, k, v)
+        k = k.to(q.dtype)
+        v = v.to(q.dtype)
+        hidden_states = xformers.ops.memory_efficient_attention(q, k, v)
         hidden_states = hidden_states.transpose(1, 2).reshape(batch_size, -1, self.num_heads * self.head_dim)
         hidden_states = hidden_states.to(q.dtype)
         hidden_states = self.a_to_out(hidden_states)
@@ -291,6 +370,113 @@ class JointTransformerBlock(torch.nn.Module):
         hidden_states_b = hidden_states_b + gate_mlp_b * self.ff_b(norm_hidden_states_b)
 
         return hidden_states_a, hidden_states_b
+    
+class JointTransformerBlockWithEnvmapAdaLN(torch.nn.Module):
+    def __init__(self, dim, num_attention_heads, use_rms_norm=False, dual=False):
+        super().__init__()
+        self.norm1_a = AdaLayerNorm(dim, dual=dual)
+        self.norm1_b = AdaLayerNorm(dim)
+
+        self.attn = JointAttention(dim, dim, num_attention_heads, dim // num_attention_heads, use_rms_norm=use_rms_norm)
+        if dual:
+            self.attn2 = SingleAttention(dim, num_attention_heads, dim // num_attention_heads, use_rms_norm=use_rms_norm)
+
+        self.norm2_a = torch.nn.LayerNorm(dim, elementwise_affine=False, eps=1e-6)
+        self.ff_a = torch.nn.Sequential(
+            torch.nn.Linear(dim, dim*4),
+            torch.nn.GELU(approximate="tanh"),
+            torch.nn.Linear(dim*4, dim)
+        )
+
+        self.norm2_b = torch.nn.LayerNorm(dim, elementwise_affine=False, eps=1e-6)
+        self.ff_b = torch.nn.Sequential(
+            torch.nn.Linear(dim, dim*4),
+            torch.nn.GELU(approximate="tanh"),
+            torch.nn.Linear(dim*4, dim)
+        )
+
+
+    def forward(self, hidden_states_a, hidden_states_b, hidden_states_envmap, temb):
+        # TODO: implement envmap adaLN
+        if self.norm1_a.dual:
+            norm_hidden_states_a, gate_msa_a, shift_mlp_a, scale_mlp_a, gate_mlp_a, norm_hidden_states_a_2, gate_msa_a_2 = self.norm1_a(hidden_states_a, emb=temb)
+        else:
+            norm_hidden_states_a, gate_msa_a, shift_mlp_a, scale_mlp_a, gate_mlp_a = self.norm1_a(hidden_states_a, emb=temb)
+        
+        norm_hidden_states_b, gate_msa_b, shift_mlp_b, scale_mlp_b, gate_mlp_b = self.norm1_b(hidden_states_b, emb=temb)
+        norm_hidden_states_envmap = self.norm1_b(hidden_states_envmap, emb=temb)
+
+        # Attention
+        attn_output_a, attn_output_b = self.attn(norm_hidden_states_a, norm_hidden_states_b)
+
+        # Part A
+        hidden_states_a = hidden_states_a + gate_msa_a * attn_output_a
+        if self.norm1_a.dual:
+            hidden_states_a = hidden_states_a + gate_msa_a_2 * self.attn2(norm_hidden_states_a_2)
+        norm_hidden_states_a = self.norm2_a(hidden_states_a) * (1 + scale_mlp_a) + shift_mlp_a
+        hidden_states_a = hidden_states_a + gate_mlp_a * self.ff_a(norm_hidden_states_a)
+
+        # Part B
+        hidden_states_b = hidden_states_b + gate_msa_b * attn_output_b
+        norm_hidden_states_b = self.norm2_b(hidden_states_b) * (1 + scale_mlp_b) + shift_mlp_b
+        hidden_states_b = hidden_states_b + gate_mlp_b * self.ff_b(norm_hidden_states_b)
+
+        return hidden_states_a, hidden_states_b
+
+class JointTransformerBlockWithEnvmapCrossAttn(torch.nn.Module):
+    def __init__(self, dim, num_attention_heads, use_rms_norm=False, dual=False):
+        super().__init__()
+        self.norm1_a = AdaLayerNorm(dim, dual=dual)
+        self.norm1_b = AdaLayerNorm(dim)
+
+        self.attn = JointAttention(dim, dim, num_attention_heads, dim // num_attention_heads, use_rms_norm=use_rms_norm)
+        if dual:
+            self.attn2 = SingleAttention(dim, num_attention_heads, dim // num_attention_heads, use_rms_norm=use_rms_norm)
+
+        self.attn_envmap = CrossAttention(dim, num_attention_heads)
+
+        self.norm2_a = torch.nn.LayerNorm(dim, elementwise_affine=False, eps=1e-6)
+        self.ff_a = torch.nn.Sequential(
+            torch.nn.Linear(dim, dim*4),
+            torch.nn.GELU(approximate="tanh"),
+            torch.nn.Linear(dim*4, dim)
+        )
+
+        self.norm2_b = torch.nn.LayerNorm(dim, elementwise_affine=False, eps=1e-6)
+        self.ff_b = torch.nn.Sequential(
+            torch.nn.Linear(dim, dim*4),
+            torch.nn.GELU(approximate="tanh"),
+            torch.nn.Linear(dim*4, dim)
+        )
+
+
+    def forward(self, hidden_states_a, hidden_states_b, hidden_states_envmap, temb):
+        if self.norm1_a.dual:
+            norm_hidden_states_a, gate_msa_a, shift_mlp_a, scale_mlp_a, gate_mlp_a, norm_hidden_states_a_2, gate_msa_a_2 = self.norm1_a(hidden_states_a, emb=temb)
+        else:
+            norm_hidden_states_a, gate_msa_a, shift_mlp_a, scale_mlp_a, gate_mlp_a = self.norm1_a(hidden_states_a, emb=temb)
+        norm_hidden_states_b, gate_msa_b, shift_mlp_b, scale_mlp_b, gate_mlp_b = self.norm1_b(hidden_states_b, emb=temb)
+
+        # Attention
+        attn_output_a, attn_output_b = self.attn(norm_hidden_states_a, norm_hidden_states_b)
+        
+        attn_output_envmap = self.attn_envmap(norm_hidden_states_a, hidden_states_envmap)
+        
+        # Part A
+        hidden_states_a = hidden_states_a + gate_msa_a * attn_output_a
+        if self.norm1_a.dual:
+            hidden_states_a = hidden_states_a + gate_msa_a_2 * self.attn2(norm_hidden_states_a_2)
+        norm_hidden_states_a = self.norm2_a(hidden_states_a) * (1 + scale_mlp_a) + shift_mlp_a
+        hidden_states_a = hidden_states_a + gate_mlp_a * self.ff_a(norm_hidden_states_a)
+        
+        hidden_states_a = hidden_states_a + attn_output_envmap
+
+        # Part B
+        hidden_states_b = hidden_states_b + gate_msa_b * attn_output_b
+        norm_hidden_states_b = self.norm2_b(hidden_states_b) * (1 + scale_mlp_b) + shift_mlp_b
+        hidden_states_b = hidden_states_b + gate_mlp_b * self.ff_b(norm_hidden_states_b)
+
+        return hidden_states_a, hidden_states_b
 
 
 
@@ -333,9 +519,14 @@ class SD3DiT(torch.nn.Module):
         self.time_embedder = TimestepEmbeddings(256, embed_dim)
         self.pooled_text_embedder = torch.nn.Sequential(torch.nn.Linear(2048, embed_dim), torch.nn.SiLU(), torch.nn.Linear(embed_dim, embed_dim))
         self.context_embedder = torch.nn.Linear(4096, embed_dim)
-        self.blocks = torch.nn.ModuleList([JointTransformerBlock(embed_dim, embed_dim//64, use_rms_norm=use_rms_norm, dual=True) for _ in range(num_dual_blocks)]
-                                          + [JointTransformerBlock(embed_dim, embed_dim//64, use_rms_norm=use_rms_norm) for _ in range(num_layers-1-num_dual_blocks)]
-                                          + [JointTransformerFinalBlock(embed_dim, embed_dim//64, use_rms_norm=use_rms_norm)])
+        self.envmap_embedder = torch.nn.Linear(128, embed_dim)
+        # self.blocks = torch.nn.ModuleList([JointTransformerBlock(embed_dim, embed_dim//64, use_rms_norm=use_rms_norm, dual=True) for _ in range(num_dual_blocks)]
+        #                                   + [JointTransformerBlock(embed_dim, embed_dim//64, use_rms_norm=use_rms_norm) for _ in range(num_layers-1-num_dual_blocks)]
+        #                                   + [JointTransformerFinalBlock(embed_dim, embed_dim//64, use_rms_norm=use_rms_norm)])
+        
+        self.blocks = torch.nn.ModuleList([JointTransformerBlockWithEnvmapCrossAttn(embed_dim, embed_dim//64, use_rms_norm=use_rms_norm, dual=True) for _ in range(num_dual_blocks)]
+                                          + [JointTransformerBlockWithEnvmapCrossAttn(embed_dim, embed_dim//64, use_rms_norm=use_rms_norm) for _ in range(num_layers-1-num_dual_blocks)])
+        self.final_block = JointTransformerFinalBlock(embed_dim, embed_dim//64, use_rms_norm=use_rms_norm)
         self.norm_out = AdaLayerNorm(embed_dim, single=True)
         self.proj_out = torch.nn.Linear(embed_dim, 64)
 
@@ -351,14 +542,17 @@ class SD3DiT(torch.nn.Module):
         )
         return hidden_states
 
-    def forward(self, hidden_states, timestep, prompt_emb, pooled_prompt_emb, tiled=False, tile_size=128, tile_stride=64, use_gradient_checkpointing=False):
+    def forward(self, hidden_states, timestep, prompt_emb, pooled_prompt_emb, envmap_emb, tiled=False, tile_size=128, tile_stride=64, use_gradient_checkpointing=False):
         if tiled:
             return self.tiled_forward(hidden_states, timestep, prompt_emb, pooled_prompt_emb, tile_size, tile_stride)
         conditioning = self.time_embedder(timestep, hidden_states.dtype) + self.pooled_text_embedder(pooled_prompt_emb)
         prompt_emb = self.context_embedder(prompt_emb)
+        envmap_emb = self.envmap_embedder(envmap_emb)
 
         height, width = hidden_states.shape[-2:]
         hidden_states = self.pos_embedder(hidden_states)
+
+        # TODO: add positional embedding for envmap
 
         def create_custom_forward(module):
             def custom_forward(*inputs):
@@ -369,11 +563,13 @@ class SD3DiT(torch.nn.Module):
             if self.training and use_gradient_checkpointing:
                 hidden_states, prompt_emb = torch.utils.checkpoint.checkpoint(
                     create_custom_forward(block),
-                    hidden_states, prompt_emb, conditioning,
+                    hidden_states, prompt_emb, envmap_emb, conditioning,
                     use_reentrant=False,
                 )
             else:
-                hidden_states, prompt_emb = block(hidden_states, prompt_emb, conditioning)
+                hidden_states, prompt_emb = block(hidden_states, prompt_emb, envmap_emb, conditioning)
+        
+        hidden_states, prompt_emb = self.final_block(hidden_states, prompt_emb, conditioning)
         
         hidden_states = self.norm_out(hidden_states, conditioning)
         hidden_states = self.proj_out(hidden_states)

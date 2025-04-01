@@ -8,12 +8,15 @@ from PIL import Image
 class TextImageDataset(torch.utils.data.Dataset):
     def __init__(self, dataset_path, steps_per_epoch=10000, height=1024, width=1024, center_crop=True, random_flip=False):
         self.steps_per_epoch = steps_per_epoch
-        # metadata = pd.read_csv(os.path.join(dataset_path, "train/metadata.csv"))
-        metadata = pd.read_csv("/ocean/projects/cis250002p/rju/datasets/metadata.csv")
-        # self.path = [os.path.join(dataset_path, "train", file_name) for file_name in metadata["file_name"]]
-        # self.text = metadata["text"].to_list()
-        self.path = metadata["file_name"].to_list()
-        self.text = [""] * len(self.path)
+        
+        metadata = pd.read_csv(os.path.join(dataset_path, "train/metadata.csv"))
+        # metadata = pd.read_csv(dataset_path)
+        
+        self.path = [os.path.join(dataset_path, "train", file_name) for file_name in metadata["file_name"]]
+        self.text = metadata["text"].to_list()
+        # self.path = metadata["file_name"].to_list()
+        # self.text = [""] * len(self.path)
+        
         self.height = height
         self.width = width
         self.image_processor = transforms.Compose(
