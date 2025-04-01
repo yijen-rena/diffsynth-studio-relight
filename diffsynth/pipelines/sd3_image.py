@@ -66,42 +66,11 @@ class SD3ImagePipeline(BasePipeline):
         )
         return {"prompt_emb": prompt_emb, "pooled_prompt_emb": pooled_prompt_emb}
     
-    # def encode_envir_map(self, envir_map_path, camera_poses_path):
-    #     from diffusers import AutoencoderKLTemporalDecoder
-        
-    #     if isinstance(envir_map_path, list):
-    #         envir_map_path = envir_map_path[0]
-        
-    #     if isinstance(camera_poses_path, list):
-    #         camera_poses_path = camera_poses_path[0]
-        
-    #     envir_map_hdr = read_hdr(envir_map_path, return_type='np')
-    #     with open(camera_poses_path, 'r') as f:
-    #         camera_poses = json.load(f)
-            
-    #     cam2world = np.array(camera_poses['frame_0'])
-        
-    #     envir_map_remapped = env_map_to_cam_to_world_by_convention(envir_map_hdr, cam2world)
-    #     envir_map_ldr = reinhard_tonemap(envir_map_remapped)
-    #     envir_map_ldr_img = Image.fromarray((envir_map_ldr * 255).astype(np.uint8)).convert('RGB')
-
-    #     envir_map_ldr = torch.from_numpy(envir_map_ldr).permute(2, 0, 1).unsqueeze(0).to(self.device, dtype=torch.float16)
-    #     envir_map_embeddings = self.encode_image(envir_map_ldr)
-                
-    #     # downsample envmap_image_embedding by factor of 8
-    #     envir_map_embeddings = F.interpolate(
-    #         envir_map_embeddings,
-    #         size=(
-    #             envir_map_embeddings.shape[-2] // 8,
-    #             envir_map_embeddings.shape[-1] // 8
-    #         ),
-    #         mode='bilinear',
-    #         align_corners=False
-    #     )
-    #     # flatten and repeat envmap_image_embedding for each frame
-    #     envir_map_embeddings = envir_map_embeddings.flatten(start_dim=1) # [batch_size, 4 * H // 8 * W // 8]
-        
-    #     return {"envmap_emb": envir_map_embeddings}
+    def encode_envir_map(self, envmap):
+        envmap_emb = self.encode_image(envmap)
+        b, h, w, c = envmap_emb.shape
+        envmap_emb = envmap_emb.reshape(1, h * w, c) # [1, 64 * 16, 128]
+        return {"envmap_emb": envmap_emb}
     
     def prepare_extra_input(self, latents=None):
         return {}

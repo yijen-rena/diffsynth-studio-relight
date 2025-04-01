@@ -181,7 +181,6 @@ class ValidationImageCallback(pl.Callback):
         
         with torch.no_grad():
             for prompt in self.validation_prompts:
-                envmap = Image.open(self.envmap_path)
                 image = pl_module.pipe(
                     prompt=prompt,
                     cfg_scale=self.cfg_scale,
