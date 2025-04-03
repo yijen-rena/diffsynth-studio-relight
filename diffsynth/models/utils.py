@@ -4,7 +4,7 @@ from contextlib import contextmanager
 import hashlib
 
 @contextmanager
-def init_weights_on_device(device = torch.device("meta"), include_buffers :bool = False):
+def init_weights_on_device(device = torch.device("cuda"), include_buffers :bool = False):
     
     old_register_parameter = torch.nn.Module.register_parameter
     if include_buffers:

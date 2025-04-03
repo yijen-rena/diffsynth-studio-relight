@@ -26,9 +26,8 @@ import pdb
 ENV_MAP_PATH = "/ocean/projects/cis240022p/ylitman/VSCode/RelightingDiffusion/data/fullres_light_probes"
 
 def fovx_to_fovy(fov_x, aspect_ratio):
-    fov_x_rad = math.radians(fov_x)
-    fov_y_rad = 2 * math.atan(math.tan(fov_x_rad / 2) * aspect_ratio)
-    fov_y = math.degrees(fov_y_rad)
+    # fov_x_rad = math.radians(fov_x)
+    fov_y = 2 * math.atan(math.tan(fov_x / 2) * aspect_ratio)
     return fov_y
 
 def perspective(fovy, aspect, near, far):
@@ -178,6 +177,17 @@ def env_map_to_cam_to_world_by_convention(envmap: np.ndarray, c2w):
     envmap_remapped = cv2.remap(envmap, coord_x, coord_y, cv2.INTER_LINEAR)
 
     return envmap_remapped
+
+def transform_envmap(envmap, transform, height, width, dtype=torch.float16):
+    env = env_map_to_cam_to_world_by_convention(envmap, torch.linalg.inv(transform).numpy())
+    env = torch.from_numpy(env).permute(2, 0, 1)
+    env = torchvision.transforms.Resize((height, width))(env)
+    
+    if dtype == torch.float16:
+        env = env.float() / 255.0
+        env = env.half()
+    
+    return env
 
 ##### Below are functions for preprocessing environment map, copied from Neural Gaffer #####
 
@@ -708,14 +718,12 @@ class DatasetNERFMultiRelight(Dataset):
 
 
 class DatasetTextAndEnvmapToImage(Dataset):
-    # def __init__(self, dataset_path, steps_per_epoch=10000, height=1024, width=1024, center_crop=True, random_flip=False):
-    def __init__(self, config_path, args, examples=None):
-        self.examples = examples
+    def __init__(self, config_path, envmap_path, steps_per_epoch=10000, height=1024, width=1024, center_crop=True, random_flip=False):
         self.base_dir = os.path.dirname(config_path)
-        self.args = args
-        self.steps_per_epoch = args.steps_per_epoch
-        self.height = args.height
-        self.width = args.width
+        self.envmap_path = envmap_path
+        self.steps_per_epoch = steps_per_epoch
+        self.height = height
+        self.width = width
         
         # metadata = pd.read_csv(os.path.join(self.base_dir, "metadata.csv"))
         # self.text = metadata["text"].to_list()
@@ -739,9 +747,6 @@ class DatasetTextAndEnvmapToImage(Dataset):
         self.n_objs = len(frames)
         self.n_envmaps = len(frames[0])
         self.n_views = len(frames[0][0]["views"])
-        self.k_views = 4
-        if self.k_views > self.n_views:
-            self.k_views = self.n_views
 
         # Determine resolution & aspect ratio
         self.data_resolution = imageio.imread(os.path.join(self.base_dir, frames[0][0]["views"][0]['file_path'] + ".png")).shape[0:2]
@@ -779,29 +784,22 @@ class DatasetTextAndEnvmapToImage(Dataset):
         # Load image
         view = obj_views[view_idx]
         img = read_hdr(os.path.join(self.base_dir, view['file_path']), return_type='torch').permute(2, 0, 1)
+        img = torchvision.transforms.Resize((self.height, self.width))(img)
         
         # Camera parameters
         frame_transform = torch.tensor(view['transform_matrix'], dtype=torch.float32)
         mv = torch.linalg.inv(frame_transform)
-        mv = mv @ rotate_x(-np.pi / 2)
-        mvp = self.proj @ mv
-        t, r = frame_transform[:3, 3], torch.linalg.norm(frame_transform[:3, 3])
-        theta, phi = torch.arccos(t[2] / r), torch.arctan2(t[1], t[0])
-        mvp = torch.tensor([theta, torch.sin(phi), torch.cos(phi), r])
+        mv = mv @ rotate_x(-np.pi / 2) # blender to opencv convention
 
         # Load envmap
-        try:
-            env = imageio.imread(os.path.join(self.args.envmap_path, frame[env_idx]['env']))[..., :3]
-            if "scale" in frame[env_idx]:
-                scale = frame[env_idx]["scale"]
-            elif ".exr" in frame[env_idx]["env"]:
-                scale = 150
-            else:
-                scale = 1
-            env = env * scale
-        except Exception as e:
-            print(e)
-            env = imageio.imread(os.path.join(ENV_MAP_PATH, frame[env_idx]['env']))[..., :3]
+        env = imageio.imread(os.path.join(self.envmap_path, frame[env_idx]['env']))[..., :3]
+        if "scale" in frame[env_idx]:
+            scale = frame[env_idx]["scale"]
+        elif ".exr" in frame[env_idx]["env"]:
+            scale = 150
+        else:
+            scale = 1
+        env = env * scale
             
         # Transformations
         if "rotation" in frame[env_idx]:
@@ -811,26 +809,22 @@ class DatasetTextAndEnvmapToImage(Dataset):
         if "flip" in frame[env_idx]:
             if frame[env_idx]["flip"]:
                 env = env[..., ::-1, :]
-                
-        env = env_map_to_cam_to_world_by_convention(env, torch.linalg.inv(mv).numpy())
-        env = torch.from_numpy(env).permute(2, 0, 1)
-        env = env.float() / 255.0
-        env = env.half()
 
-        return img, mvp, env, self.dir_embeds
+        env = transform_envmap(env, mv, self.height, self.width)
+
+        return img, mv, env, self.dir_embeds, self.text[idx]
 
     def __len__(self):
-        # return self.n_objs if self.examples is None else self.examples
-        return self.steps_per_epoch
+        return self.n_objs
 
     def __getitem__(self, itr):
-        imgs, mvps, envs, dir_embeds = self._parse_frame(self.config, itr % self.n_objs)
-
+        img, mv, env, dir_embeds, text = self._parse_frame(self.config, itr % self.n_objs)
+        
         return {
-            'text' : self.text[itr % self.n_objs],
-            'image' : imgs,
-            'envmap' : envs,
+            'text' : "",
+            'image' : img,
+            'envmap' : env,
             'dir_embeds' : dir_embeds,
-            'T' : mvps,
+            'T' : mv,
             'resolution' : (self.width, self.height),
         }

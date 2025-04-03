@@ -69,7 +69,7 @@ class SD3ImagePipeline(BasePipeline):
     def encode_envir_map(self, envmap):
         envmap_emb = self.encode_image(envmap)
         b, h, w, c = envmap_emb.shape
-        envmap_emb = envmap_emb.reshape(1, h * w, c) # [1, 64 * 16, 128]
+        envmap_emb = envmap_emb.reshape(b, h * w, c)
         return {"envmap_emb": envmap_emb}
     
     def prepare_extra_input(self, latents=None):
@@ -84,8 +84,7 @@ class SD3ImagePipeline(BasePipeline):
         masks=[],
         mask_scales=[],
         negative_prompt="",
-        envir_map_path=None,
-        camera_poses_path=None,
+        envmap_emb=None,
         cfg_scale=7.5,
         input_image=None,
         denoising_strength=1.0,

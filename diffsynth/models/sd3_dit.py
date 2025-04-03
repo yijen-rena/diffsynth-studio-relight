@@ -460,7 +460,8 @@ class JointTransformerBlockWithEnvmapCrossAttn(torch.nn.Module):
         # Attention
         attn_output_a, attn_output_b = self.attn(norm_hidden_states_a, norm_hidden_states_b)
         
-        attn_output_envmap = self.attn_envmap(norm_hidden_states_a, hidden_states_envmap)
+        if hidden_states_envmap is not None:
+            attn_output_envmap = self.attn_envmap(norm_hidden_states_a, hidden_states_envmap)
         
         # Part A
         hidden_states_a = hidden_states_a + gate_msa_a * attn_output_a
@@ -469,7 +470,8 @@ class JointTransformerBlockWithEnvmapCrossAttn(torch.nn.Module):
         norm_hidden_states_a = self.norm2_a(hidden_states_a) * (1 + scale_mlp_a) + shift_mlp_a
         hidden_states_a = hidden_states_a + gate_mlp_a * self.ff_a(norm_hidden_states_a)
         
-        hidden_states_a = hidden_states_a + attn_output_envmap
+        if hidden_states_envmap is not None:
+            hidden_states_a = hidden_states_a + attn_output_envmap
 
         # Part B
         hidden_states_b = hidden_states_b + gate_msa_b * attn_output_b
@@ -496,7 +498,7 @@ class JointTransformerFinalBlock(torch.nn.Module):
         )
 
 
-    def forward(self, hidden_states_a, hidden_states_b, temb):
+    def forward(self, hidden_states_a, hidden_states_b, hidden_states_envmap, temb):
         norm_hidden_states_a, gate_msa_a, shift_mlp_a, scale_mlp_a, gate_mlp_a = self.norm1_a(hidden_states_a, emb=temb)
         norm_hidden_states_b = self.norm1_b(hidden_states_b, emb=temb)
 
@@ -519,14 +521,13 @@ class SD3DiT(torch.nn.Module):
         self.time_embedder = TimestepEmbeddings(256, embed_dim)
         self.pooled_text_embedder = torch.nn.Sequential(torch.nn.Linear(2048, embed_dim), torch.nn.SiLU(), torch.nn.Linear(embed_dim, embed_dim))
         self.context_embedder = torch.nn.Linear(4096, embed_dim)
-        self.envmap_embedder = torch.nn.Linear(128, embed_dim)
+        self.envmap_embedder = torch.nn.Linear(32, embed_dim) # FIXME: is this correct? is this over the entire batch?
+        self.blocks = torch.nn.ModuleList([JointTransformerBlockWithEnvmapCrossAttn(embed_dim, embed_dim//64, use_rms_norm=use_rms_norm, dual=True) for _ in range(num_dual_blocks)]
+                                          + [JointTransformerBlockWithEnvmapCrossAttn(embed_dim, embed_dim//64, use_rms_norm=use_rms_norm) for _ in range(num_layers-1-num_dual_blocks)]
+                                          + [JointTransformerFinalBlock(embed_dim, embed_dim//64, use_rms_norm=use_rms_norm)])
         # self.blocks = torch.nn.ModuleList([JointTransformerBlock(embed_dim, embed_dim//64, use_rms_norm=use_rms_norm, dual=True) for _ in range(num_dual_blocks)]
         #                                   + [JointTransformerBlock(embed_dim, embed_dim//64, use_rms_norm=use_rms_norm) for _ in range(num_layers-1-num_dual_blocks)]
         #                                   + [JointTransformerFinalBlock(embed_dim, embed_dim//64, use_rms_norm=use_rms_norm)])
-        
-        self.blocks = torch.nn.ModuleList([JointTransformerBlockWithEnvmapCrossAttn(embed_dim, embed_dim//64, use_rms_norm=use_rms_norm, dual=True) for _ in range(num_dual_blocks)]
-                                          + [JointTransformerBlockWithEnvmapCrossAttn(embed_dim, embed_dim//64, use_rms_norm=use_rms_norm) for _ in range(num_layers-1-num_dual_blocks)])
-        self.final_block = JointTransformerFinalBlock(embed_dim, embed_dim//64, use_rms_norm=use_rms_norm)
         self.norm_out = AdaLayerNorm(embed_dim, single=True)
         self.proj_out = torch.nn.Linear(embed_dim, 64)
 
@@ -542,12 +543,14 @@ class SD3DiT(torch.nn.Module):
         )
         return hidden_states
 
-    def forward(self, hidden_states, timestep, prompt_emb, pooled_prompt_emb, envmap_emb, tiled=False, tile_size=128, tile_stride=64, use_gradient_checkpointing=False):
+    def forward(self, hidden_states, timestep, prompt_emb, pooled_prompt_emb, envmap_emb=None, tiled=False, tile_size=128, tile_stride=64, use_gradient_checkpointing=False):
         if tiled:
             return self.tiled_forward(hidden_states, timestep, prompt_emb, pooled_prompt_emb, tile_size, tile_stride)
         conditioning = self.time_embedder(timestep, hidden_states.dtype) + self.pooled_text_embedder(pooled_prompt_emb)
         prompt_emb = self.context_embedder(prompt_emb)
-        envmap_emb = self.envmap_embedder(envmap_emb)
+        
+        if envmap_emb is not None:
+            envmap_emb = self.envmap_embedder(envmap_emb)
 
         height, width = hidden_states.shape[-2:]
         hidden_states = self.pos_embedder(hidden_states)
@@ -568,9 +571,17 @@ class SD3DiT(torch.nn.Module):
                 )
             else:
                 hidden_states, prompt_emb = block(hidden_states, prompt_emb, envmap_emb, conditioning)
-        
-        hidden_states, prompt_emb = self.final_block(hidden_states, prompt_emb, conditioning)
-        
+
+        # for block in self.blocks:
+        #     if self.training and use_gradient_checkpointing:
+        #         hidden_states, prompt_emb = torch.utils.checkpoint.checkpoint(
+        #             create_custom_forward(block),
+        #             hidden_states, prompt_emb, conditioning,
+        #             use_reentrant=False,
+        #         )
+        #     else:
+        #         hidden_states, prompt_emb = block(hidden_states, prompt_emb, conditioning)
+
         hidden_states = self.norm_out(hidden_states, conditioning)
         hidden_states = self.proj_out(hidden_states)
         hidden_states = rearrange(hidden_states, "B (H W) (P Q C) -> B C (H P) (W Q)", P=2, Q=2, H=height//2, W=width//2)

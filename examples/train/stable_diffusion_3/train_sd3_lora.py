@@ -37,18 +37,16 @@ class LightningModel(LightningModelForT2ILoRA):
         self.pretrained_lora_path = pretrained_lora_path
         
         self.pipe = SD3ImagePipeline.from_model_manager(model_manager)
-
-        self.pipe.scheduler.set_timesteps(1000, training=True)
-
         self.freeze_parameters()
+        
+        self.pipe.scheduler.set_timesteps(1000, training=True)
         
         for name, param in self.pipe.denoising_model().named_parameters():
             if "envmap" in name:
                 print(name)
+                with torch.no_grad():
+                    param.data = param.to(torch.float32)
                 param.requires_grad = True
-                param.data = param.to(torch.float32)
-                
-        self.pipe.denoising_model().train()
 
     def configure_optimizers(self):
         trainable_modules = filter(lambda p: p.requires_grad, self.pipe.denoising_model().parameters())
@@ -118,13 +116,12 @@ if __name__ == '__main__':
         pretrained_lora_path=args.pretrained_lora_path,
         lora_target_modules=args.lora_target_modules
     )
-    from pytorch_lightning.loggers import WandbLogger
-    wandb_logger = WandbLogger(
-        project="diffsynth_studio-relight",
-        name="diffsynth_studio-relight",
-        config=vars(args),
-        save_dir=args.output_path,
-    )
+        
+    # for name, param in model.pipe.denoising_model().named_parameters():
+    #     if param.requires_grad and torch.isnan(param).any():
+    #         print(f"NaN detected in parameter {name} after initializing LightningModel")
+    #     if param.requires_grad and torch.isinf(param).any():
+    #         print(f"Inf detected in parameter {name} after initializing LightningModel")
     
     resume_from_checkpoint = None
     launch_training_task(model, args, resume_from_checkpoint)

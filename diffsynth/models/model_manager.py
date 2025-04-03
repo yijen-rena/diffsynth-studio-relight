@@ -72,36 +72,14 @@ def load_model_from_single_file(state_dict, model_names, model_classes, model_re
             model = model_class(**extra_kwargs)
         if hasattr(model, "eval"):
             model = model.eval()
-        
-        model_keys = set(model.state_dict().keys())
-        load_keys = set(model_state_dict.keys())
-        missing_keys = model_keys - load_keys
-        
-        for key in missing_keys:
-            param_shape = model.state_dict()[key].shape
-            if key.endswith("bias"):
-                model.state_dict()[key] = torch.nn.Parameter(
-                    torch.zeros(param_shape, dtype=torch_dtype, device=device)
-                )
-            elif "norm" in key:
-                model.state_dict()[key] = torch.nn.Parameter(
-                    torch.ones(param_shape, dtype=torch_dtype, device=device)
-                )
-            else:
-                model.state_dict()[key] = torch.nn.Parameter(
-                    torch.randn(param_shape, dtype=torch_dtype, device=device)
-                )
-        
-        model.load_state_dict(model_state_dict, assign=True, strict=False)
-        
-        try:
-            model = model.to(dtype=torch_dtype, device=device)
-        except NotImplementedError as e:
-            if "Cannot copy out of meta tensor" in str(e):
-                model = model.to_empty(device=device).to(dtype=torch_dtype)
-            else:
-                raise e
-        
+                
+        if model_name == "sd3_dit":
+            model.load_state_dict(model_state_dict, assign=True, strict=False)
+            model.to(dtype=torch_dtype, device=device)
+        else:
+            model.load_state_dict(model_state_dict, assign=True)
+            model.to(dtype=torch_dtype, device=device)
+
         loaded_model_names.append(model_name)
         loaded_models.append(model)
     return loaded_model_names, loaded_models
@@ -210,6 +188,13 @@ class ModelDetectorFromSingleFile:
         if keys_hash_with_shape in self.keys_hash_with_shape_dict:
             model_names, model_classes, model_resource = self.keys_hash_with_shape_dict[keys_hash_with_shape]
             loaded_model_names, loaded_models = load_model_from_single_file(state_dict, model_names, model_classes, model_resource, torch_dtype, device)
+            # for model in loaded_models:
+            #     for name, param in model.named_parameters():
+            #         if torch.isnan(param).any():
+            #             print(f"NaN detected in parameter {name} in ModelDetectorFromSingleFile.load()")
+            #         if torch.isinf(param).any():
+            #             print(f"Inf detected in parameter {name} in ModelDetectorFromSingleFile.load()")
+            
             return loaded_model_names, loaded_models
 
         # Load models without strict matching

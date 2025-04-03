@@ -32,7 +32,7 @@ class LightningModelForT2ILoRA(pl.LightningModule):
         # Freeze parameters
         self.pipe.requires_grad_(False)
         self.pipe.eval()
-        # self.pipe.denoising_model().train()
+        self.pipe.denoising_model().train()
 
     
     def add_lora_to_model(
@@ -63,7 +63,6 @@ class LightningModelForT2ILoRA(pl.LightningModule):
         for name, param in model.named_parameters():
             # Upcast LoRA parameters into fp32
             if param.requires_grad:
-                print(name)
                 param.data = param.to(lora_weight_precision)
 
         # Lora pretrained lora weights
@@ -110,7 +109,6 @@ class LightningModelForT2ILoRA(pl.LightningModule):
     #     return loss
     
     def training_step(self, batch, batch_idx):
-        # Data
         text, image, envmap, dir_embeds, T = batch["text"], batch["image"], batch["envmap"], batch["dir_embeds"], batch["T"]
 
         # Prepare input parameters
@@ -381,7 +379,11 @@ def launch_training_task(model, args, resume_from_checkpoint=None):
     # )
     dataset = DatasetTextAndEnvmapToImage(
         args.dataset_config_path,
-        args
+        steps_per_epoch=args.steps_per_epoch,
+        height=args.height,
+        width=args.width,
+        center_crop=args.center_crop,
+        envmap_path=args.envmap_path
     )
     train_loader = torch.utils.data.DataLoader(
         dataset,
@@ -417,7 +419,9 @@ def launch_training_task(model, args, resume_from_checkpoint=None):
     else:
         logger = None
         
-    callbacks = [pl.pytorch.callbacks.ModelCheckpoint(save_top_k=-1)]
+    callbacks = [
+        pl.pytorch.callbacks.ModelCheckpoint(save_top_k=-1),
+    ]
     
     if args.use_wandb:
         validation_callback = ValidationImageCallback(
@@ -440,7 +444,8 @@ def launch_training_task(model, args, resume_from_checkpoint=None):
     if resume_from_checkpoint is not None:
         trainer.fit(model=model, train_dataloaders=train_loader, ckpt_path=resume_from_checkpoint)
     else:
-        trainer.fit(model=model, train_dataloaders=train_loader)
+        # import pdb; pdb.set_trace()
+        trainer.fit(model=model, train_dataloaders=train_loader) # FIXME: make sure len(train_loader) is 519 is correct?
 
     # Upload models
     if args.modelscope_model_id is not None and args.modelscope_access_token is not None:
