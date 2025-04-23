@@ -13,6 +13,9 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 
+cache_dir="/ocean/projects/cis250002p/rju/huggingface/hub"
+
+
 import argparse
 import logging
 import math
@@ -20,40 +23,48 @@ import os
 import random
 import shutil
 from pathlib import Path
-
-import accelerate
+import sys
+import torchvision
+import kornia
+import itertools
 import numpy as np
-import torch
-import torch.nn.functional as F
-import torch.utils.checkpoint
-import transformers
-from accelerate import Accelerator
-from accelerate.logging import get_logger
-from accelerate.utils import ProjectConfiguration, set_seed
-from dataset import ObjaverseDataLoader, ObjaverseData
+from tqdm.auto import tqdm
 from huggingface_hub import create_repo, upload_folder
 from packaging import version
 from PIL import Image
+from typing import Union, List, Optional
+
+import torch
+import torch.nn.functional as F
+import torch.utils.checkpoint
 from torchvision import transforms
-from tqdm.auto import tqdm
-from transformers import PretrainedConfig, CLIPVisionModelWithProjection, CLIPImageProcessor, CLIPFeatureExtractor
+
+import accelerate
+from accelerate import Accelerator
+from accelerate.logging import get_logger
+from accelerate.utils import ProjectConfiguration, set_seed
+
+
+import transformers
+from transformers import CLIPTokenizer, CLIPTextModel, CLIPTextModelWithProjection, T5EncoderModel, T5TokenizerFast
 
 import diffusers
 from diffusers import (
     AutoencoderKL,
-    DDIMScheduler,
-    DDPMScheduler,
-    UNet2DConditionModel,
+    FlowMatchEulerDiscreteScheduler,
+    SD3Transformer2DModel
 )
-# from pipeline_zero1to3 import Zero1to3StableDiffusionPipeline, CCProjection
-from sd3_image import SD3ImagePipeline
+
+from diffusers import StableDiffusion3Pipeline
 from diffusers.optimization import get_scheduler
 from diffusers.utils import check_min_version, is_wandb_available
 from diffusers.utils.import_utils import is_xformers_available
 from diffusers.training_utils import EMAModel
-import torchvision
-import kornia
-import itertools
+
+# from dataset import ObjaverseDataLoader, ObjaverseData
+from diffsynth.data.data_utils import DatasetTextAndEnvmapToImage, TextImageDataset
+from diffsynth.models.sd3_dit import SD3DiT
+# from diffsynth.models.sd3_image import SD3ImagePipeline
 
 if is_wandb_available():
     import wandb
@@ -75,20 +86,22 @@ def image_grid(imgs, rows, cols):
     return grid
 
 
-def log_validation(validation_dataloader, vae, image_encoder, feature_extractor, unet, cc_projection, args, accelerator, weight_dtype, split="val"):
+def log_validation(validation_dataloader, vae, text_encoder, tokenizer, dit, args, accelerator, weight_dtype, epoch,split="val"):
     logger.info("Running {} validation... ".format(split))
 
-    scheduler = DDIMScheduler.from_pretrained(args.pretrained_model_name_or_path, subfolder="scheduler")
-    pipeline = Zero1to3StableDiffusionPipeline.from_pretrained(
+    scheduler = FlowMatchEulerDiscreteScheduler.from_pretrained(
+        args.pretrained_model_name_or_path, subfolder="scheduler", cache_dir=cache_dir
+    )
+    pipeline = StableDiffusion3Pipeline.from_pretrained(
         args.pretrained_model_name_or_path,
         vae=accelerator.unwrap_model(vae).eval(),
-        image_encoder=accelerator.unwrap_model(image_encoder).eval(),
-        feature_extractor=feature_extractor,
-        unet=accelerator.unwrap_model(unet).eval(),
-        cc_projection=accelerator.unwrap_model(cc_projection).eval(),
+        text_encoder=accelerator.unwrap_model(text_encoder).eval(),
+        tokenizer=tokenizer,
+        dit=accelerator.unwrap_model(dit).eval(),
         scheduler=scheduler,
         safety_checker=None,
         torch_dtype=weight_dtype,
+        cache_dir=cache_dir
     )
 
     pipeline = pipeline.to(accelerator.device)
@@ -103,57 +116,31 @@ def log_validation(validation_dataloader, vae, image_encoder, feature_extractor,
         generator = torch.Generator(device=accelerator.device).manual_seed(args.seed)
 
     image_logs = []
-    for valid_step, batch in tqdm(enumerate(validation_dataloader)):
-        if args.num_validation_batches is not None and valid_step >= args.num_validation_batches:
-            break
-        gt_image = batch["image_target"].to(dtype=weight_dtype)
-        input_image = batch["image_cond"].to(dtype=weight_dtype)
-        pose = batch["T"].to(dtype=weight_dtype)
-        images = []
-        h, w = input_image.shape[2:]
-        for _ in range(args.num_validation_images):
-            with torch.autocast("cuda"):
-                image = pipeline(input_imgs=input_image, prompt_imgs=input_image, poses=pose, height=h, width=w,
-                                 guidance_scale=args.guidance_scale, num_inference_steps=50, generator=generator).images[0]
-
-            images.append(image)
-
-        image_logs.append(
-            {"gt_image": gt_image, "pred_images": images, "pose": pose, "input_image": input_image}
-        )
-
-    # after validation, set the pipeline back to training mode
-    unet.train()
-    vae.train()
-    image_encoder.train()
-    cc_projection.train()
-
-
+    for i in range(len(args.validation_prompts)):
+        with torch.autocast("cuda"):
+            image = pipeline(args.validation_prompts[i], num_inference_steps=20, generator=generator).images[0]
+        image_logs.append(image)
+        
     for tracker in accelerator.trackers:
-        if tracker.name == "wandb":
-            formatted_images = []
-
-            for log_id, log in enumerate(image_logs):
-                pred_images = log["pred_images"]  # pred
-                input_image = log["input_image"]    # input
-                gt_image = log["gt_image"]  # GT
-
-                formatted_images.append(wandb.Image(input_image, caption="{}_input".format(log_id)))
-                formatted_images.append(wandb.Image(gt_image, caption="{}_gt".format(log_id)))
-
-                for sample_id, pred_image in enumerate(pred_images): # n_samples
-                    pred_image = wandb.Image(pred_image, caption="{}_pred_{}".format(log_id, sample_id))
-                    formatted_images.append(pred_image)
-
-            tracker.log({split: formatted_images})
+        if tracker.name == "tensorboard":
+            np_images = np.stack([np.asarray(img) for img in image_logs])
+            tracker.writer.add_images("validation", np_images, epoch, dataformats="NHWC")
+        elif tracker.name == "wandb":
+            tracker.log(
+                {
+                    "validation": [
+                        wandb.Image(image, caption=f"{i}: {args.validation_prompts[i]}")
+                        for i, image in enumerate(image_logs)
+                    ]
+                }
+            )
         else:
-            logger.warn(f"image logging not implemented for {tracker.name}")
+            logger.warning(f"image logging not implemented for {tracker.name}")
 
-    # del pipeline
-    # torch.cuda.empty_cache()
+    del pipeline
+    torch.cuda.empty_cache()
 
     return image_logs
-
 
 def save_model_card(repo_id: str, image_logs=None, base_model=str, repo_folder=None):
     img_str = ""
@@ -170,22 +157,22 @@ def save_model_card(repo_id: str, image_logs=None, base_model=str, repo_folder=N
             img_str += f"![images_{i})](./images_{i}.png)\n"
 
     yaml = f"""
----
-license: creativeml-openrail-m
-base_model: {base_model}
-tags:
-- stable-diffusion
-- stable-diffusion-diffusers
-- diffusers
-inference: true
----
+    ---
+    license: creativeml-openrail-m
+    base_model: {base_model}
+    tags:
+    - stable-diffusion
+    - stable-diffusion-diffusers
+    - diffusers
+    inference: true
+    ---
     """
     model_card = f"""
-# zero123-{repo_id}
+    # zero123-{repo_id}
 
-These are zero123 weights trained on {base_model} with new type of conditioning.
-{img_str}
-"""
+    These are zero123 weights trained on {base_model} with new type of conditioning.
+    {img_str}
+    """
     with open(os.path.join(repo_folder, "README.md"), "w") as f:
         f.write(yaml + model_card)
 
@@ -282,6 +269,12 @@ def parse_args(input_args=None):
         "--gradient_checkpointing",
         action="store_true",
         help="Whether or not to use gradient checkpointing to save memory at the expense of slower backward pass.",
+    )
+    parser.add_argument(
+        "--batch_size",
+        type=int,
+        default=1,
+        help="Batch size (per device) for the training dataloader.",
     )
     parser.add_argument(
         "--learning_rate",
@@ -467,65 +460,277 @@ def parse_args(input_args=None):
 
     return args
 
-def CLIP_preprocess(x):
-    dtype = x.dtype
-    if isinstance(x, torch.Tensor):
-        if x.min() < -1.0 or x.max() > 1.0:
-            raise ValueError("Expected input tensor to have values in the range [-1, 1]")
-    x = kornia.geometry.resize(x.to(torch.float32), (224, 224), interpolation='bicubic', align_corners=True, antialias=False).to(dtype=dtype)   # not bf16
-    x = (x + 1.) / 2.
-    # renormalize according to clip
-    x = kornia.enhance.normalize(x, torch.Tensor([0.48145466, 0.4578275, 0.40821073]),
-                                 torch.Tensor([0.26862954, 0.26130258, 0.27577711]))
-    return x
+# def encode_prompt(prompt, tokenizer, text_encoder):
+#     with torch.no_grad():
+#         inputs = tokenizer(
+#             prompt, max_length=tokenizer.model_max_length, padding="max_length", truncation=True, return_tensors="pt"
+#         )
+#         prompt_embeds = text_encoder(inputs.input_ids.to(text_encoder.device))[0]
+#     return prompt_embeds
 
-def _encode_image(image_encoder, image, device, dtype, do_classifier_free_guidance):
+def _get_t5_prompt_embeds(
+    tokenizer_3,
+    text_encoder_3,
+    prompt: Union[str, List[str]] = None,
+    num_images_per_prompt: int = 1,
+    max_sequence_length: int = 256,
+    device: Optional[torch.device] = None,
+    dtype: Optional[torch.dtype] = None,
+    tokenizer_max_length: int = 77,
+):
+    device = device or text_encoder_3.device
+    dtype = dtype or text_encoder_3.dtype
 
-    image = image.to(device=device, dtype=dtype)
-    image = CLIP_preprocess(image)
-    # if not isinstance(image, torch.Tensor):
-    #     # 0-255
-    #     print("Warning: image is processed by hf's preprocess, which is different from openai original's.")
-    #     image = self.feature_extractor(images=image, return_tensors="pt").pixel_values
-    image_embeddings = image_encoder(image).image_embeds.to(dtype=dtype)
-    image_embeddings = image_embeddings.unsqueeze(1)
+    prompt = [prompt] if isinstance(prompt, str) else prompt
+    batch_size = len(prompt)
 
-    if do_classifier_free_guidance:
-        negative_prompt_embeds = torch.zeros_like(image_embeddings)
-        image_embeddings = torch.cat([negative_prompt_embeds, image_embeddings])
+    if text_encoder_3 is None:
+        return torch.zeros(
+            (
+                batch_size * num_images_per_prompt,
+                tokenizer_max_length,
+                text_encoder_3.transformer.config.joint_attention_dim,
+            ),
+            device=device,
+            dtype=dtype,
+        )
 
-    return image_embeddings.detach()
+    text_inputs = tokenizer_3(
+        prompt,
+        padding="max_length",
+        max_length=max_sequence_length,
+        truncation=True,
+        add_special_tokens=True,
+        return_tensors="pt",
+    )
+    text_input_ids = text_inputs.input_ids
+    untruncated_ids = tokenizer_3(prompt, padding="longest", return_tensors="pt").input_ids
 
-def _encode_pose(pose, device, dtype, do_classifier_free_guidance):
-    if isinstance(pose, torch.Tensor):
-        pose_embeddings = pose.unsqueeze(1).to(device=device, dtype=dtype)
-    else:
-        if isinstance(pose[0], list):
-            pose = torch.Tensor(pose)
-        else:
-            pose = torch.Tensor([pose])
-        x, y, z = pose[:, 0].unsqueeze(1), pose[:, 1].unsqueeze(1), pose[:, 2].unsqueeze(1)
-        pose_embeddings = torch.cat([torch.deg2rad(x),
-                                     torch.sin(torch.deg2rad(y)),
-                                     torch.cos(torch.deg2rad(y)),
-                                     z], dim=-1).unsqueeze(1).to(device=device, dtype=dtype)  # B, 1, 4
+    if untruncated_ids.shape[-1] >= text_input_ids.shape[-1] and not torch.equal(text_input_ids, untruncated_ids):
+        removed_text = tokenizer_3.batch_decode(untruncated_ids[:, tokenizer_max_length - 1 : -1])
+        logger.warning(
+            "The following part of your input was truncated because `max_sequence_length` is set to "
+            f" {max_sequence_length} tokens: {removed_text}"
+        )
 
-    if do_classifier_free_guidance:
-        negative_prompt_embeds = torch.zeros_like(pose_embeddings)
-        pose_embeddings = torch.cat([negative_prompt_embeds, pose_embeddings])
+    prompt_embeds = text_encoder_3(text_input_ids.to(device))[0]
 
-    return pose_embeddings.detach()
+    dtype = text_encoder_3.dtype
+    prompt_embeds = prompt_embeds.to(dtype=dtype, device=device)
 
-def _encode_image_with_pose(image_encoder, cc_projection, image, pose, device, dtype, do_classifier_free_guidance):
-    img_prompt_embeds = _encode_image(image_encoder, image, device, dtype, False)
-    pose_prompt_embeds = _encode_pose(pose, device, dtype, False)
-    prompt_embeds = torch.cat([img_prompt_embeds, pose_prompt_embeds], dim=-1)
-    prompt_embeds = cc_projection(prompt_embeds)
-    # follow 0123, add negative prompt, after projection
-    if do_classifier_free_guidance:
-        negative_prompt = torch.zeros_like(prompt_embeds)
-        prompt_embeds = torch.cat([negative_prompt, prompt_embeds])
+    _, seq_len, _ = prompt_embeds.shape
+
+    # duplicate text embeddings and attention mask for each generation per prompt, using mps friendly method
+    prompt_embeds = prompt_embeds.repeat(1, num_images_per_prompt, 1)
+    prompt_embeds = prompt_embeds.view(batch_size * num_images_per_prompt, seq_len, -1)
+
     return prompt_embeds
+
+def _get_clip_prompt_embeds(
+    tokenizer,
+    tokenizer_2,
+    text_encoder,
+    text_encoder_2,
+    prompt: Union[str, List[str]],
+    num_images_per_prompt: int = 1,
+    device: Optional[torch.device] = None,
+    clip_skip: Optional[int] = None,
+    clip_model_index: int = 0,
+    tokenizer_max_length = 77,
+):
+    if device is None:
+        device = text_encoder.device
+
+    prompt = [prompt] if isinstance(prompt, str) else prompt
+    batch_size = len(prompt)
+
+    text_inputs = tokenizer(
+        prompt,
+        padding="max_length",
+        max_length=tokenizer_max_length,
+        truncation=True,
+        return_tensors="pt",
+    )
+
+    text_input_ids = text_inputs.input_ids
+    untruncated_ids = tokenizer(prompt, padding="longest", return_tensors="pt").input_ids
+    if untruncated_ids.shape[-1] >= text_input_ids.shape[-1] and not torch.equal(text_input_ids, untruncated_ids):
+        removed_text = tokenizer.batch_decode(untruncated_ids[:, tokenizer_max_length - 1 : -1])
+        logger.warning(
+            "The following part of your input was truncated because CLIP can only handle sequences up to"
+            f" {tokenizer_max_length} tokens: {removed_text}"
+        )
+    prompt_embeds = text_encoder(text_input_ids.to(device), output_hidden_states=True)
+    pooled_prompt_embeds = prompt_embeds[0]
+
+    if clip_skip is None:
+        prompt_embeds = prompt_embeds.hidden_states[-2]
+    else:
+        prompt_embeds = prompt_embeds.hidden_states[-(clip_skip + 2)]
+
+    prompt_embeds = prompt_embeds.to(dtype=text_encoder.dtype, device=device)
+
+    _, seq_len, _ = prompt_embeds.shape
+    # duplicate text embeddings for each generation per prompt, using mps friendly method
+    prompt_embeds = prompt_embeds.repeat(1, num_images_per_prompt, 1)
+    prompt_embeds = prompt_embeds.view(batch_size * num_images_per_prompt, seq_len, -1)
+
+    pooled_prompt_embeds = pooled_prompt_embeds.repeat(1, num_images_per_prompt, 1)
+    pooled_prompt_embeds = pooled_prompt_embeds.view(batch_size * num_images_per_prompt, -1)
+
+    return prompt_embeds, pooled_prompt_embeds
+
+
+def encode_prompt(
+    tokenizer,
+    tokenizer_2,
+    tokenizer_3,
+    text_encoder,
+    text_encoder_2,
+    text_encoder_3,
+    prompt: Union[str, List[str]],
+    prompt_2: Union[str, List[str]],
+    prompt_3: Union[str, List[str]],
+    device: Optional[torch.device] = None,
+    num_images_per_prompt: int = 1,
+    do_classifier_free_guidance: bool = True,
+    negative_prompt: Optional[Union[str, List[str]]] = None,
+    negative_prompt_2: Optional[Union[str, List[str]]] = None,
+    negative_prompt_3: Optional[Union[str, List[str]]] = None,
+    prompt_embeds: Optional[torch.FloatTensor] = None,
+    negative_prompt_embeds: Optional[torch.FloatTensor] = None,
+    pooled_prompt_embeds: Optional[torch.FloatTensor] = None,
+    negative_pooled_prompt_embeds: Optional[torch.FloatTensor] = None,
+    clip_skip: Optional[int] = None,
+    max_sequence_length: int = 256,
+    lora_scale: Optional[float] = None,
+):
+    prompt = [prompt] if isinstance(prompt, str) else prompt
+    if prompt is not None:
+        batch_size = len(prompt)
+    else:
+        batch_size = prompt_embeds.shape[0]
+
+    if prompt_embeds is None:
+        prompt_2 = prompt_2 or prompt
+        prompt_2 = [prompt_2] if isinstance(prompt_2, str) else prompt_2
+
+        prompt_3 = prompt_3 or prompt
+        prompt_3 = [prompt_3] if isinstance(prompt_3, str) else prompt_3
+
+        prompt_embed, pooled_prompt_embed = _get_clip_prompt_embeds(
+            tokenizer=tokenizer,
+            tokenizer_2=tokenizer_2,
+            text_encoder=text_encoder,
+            text_encoder_2=text_encoder_2,
+            prompt=prompt,
+            device=device,
+            num_images_per_prompt=num_images_per_prompt,
+            clip_skip=clip_skip,
+            clip_model_index=0,
+        )
+        prompt_2_embed, pooled_prompt_2_embed = _get_clip_prompt_embeds(
+            tokenizer=tokenizer,
+            tokenizer_2=tokenizer_2,
+            text_encoder=text_encoder,
+            text_encoder_2=text_encoder_2,
+            prompt=prompt_2,
+            device=device,
+            num_images_per_prompt=num_images_per_prompt,
+            clip_skip=clip_skip,
+            clip_model_index=1,
+        )
+        clip_prompt_embeds = torch.cat([prompt_embed, prompt_2_embed], dim=-1)
+
+        t5_prompt_embed = _get_t5_prompt_embeds(
+            tokenizer_3=tokenizer_3,
+            text_encoder_3=text_encoder_3,
+            prompt=prompt_3,
+            num_images_per_prompt=num_images_per_prompt,
+            max_sequence_length=max_sequence_length,
+            device=device,
+        )
+
+        clip_prompt_embeds = torch.nn.functional.pad(
+            clip_prompt_embeds, (0, t5_prompt_embed.shape[-1] - clip_prompt_embeds.shape[-1])
+        )
+
+        prompt_embeds = torch.cat([clip_prompt_embeds, t5_prompt_embed], dim=-2)
+        pooled_prompt_embeds = torch.cat([pooled_prompt_embed, pooled_prompt_2_embed], dim=-1)
+
+    # if do_classifier_free_guidance and negative_prompt_embeds is None:
+    #     negative_prompt = negative_prompt or ""
+    #     negative_prompt_2 = negative_prompt_2 or negative_prompt
+    #     negative_prompt_3 = negative_prompt_3 or negative_prompt
+
+    #     # normalize str to list
+    #     negative_prompt = batch_size * [negative_prompt] if isinstance(negative_prompt, str) else negative_prompt
+    #     negative_prompt_2 = (
+    #         batch_size * [negative_prompt_2] if isinstance(negative_prompt_2, str) else negative_prompt_2
+    #     )
+    #     negative_prompt_3 = (
+    #         batch_size * [negative_prompt_3] if isinstance(negative_prompt_3, str) else negative_prompt_3
+    #     )
+
+    #     if prompt is not None and type(prompt) is not type(negative_prompt):
+    #         raise TypeError(
+    #             f"`negative_prompt` should be the same type to `prompt`, but got {type(negative_prompt)} !="
+    #             f" {type(prompt)}."
+    #         )
+    #     elif batch_size != len(negative_prompt):
+    #         raise ValueError(
+    #             f"`negative_prompt`: {negative_prompt} has batch size {len(negative_prompt)}, but `prompt`:"
+    #             f" {prompt} has batch size {batch_size}. Please make sure that passed `negative_prompt` matches"
+    #             " the batch size of `prompt`."
+    #         )
+
+    #     negative_prompt_embed, negative_pooled_prompt_embed = _get_clip_prompt_embeds(
+    #         tokenizer=tokenizer,
+    #         tokenizer_2=tokenizer_2,
+    #         text_encoder=text_encoder,
+    #         text_encoder_2=text_encoder_2,
+    #         negative_prompt=negative_prompt,
+    #         device=device,
+    #         num_images_per_prompt=num_images_per_prompt,
+    #         clip_skip=None,
+    #         clip_model_index=0,
+    #     )
+    #     negative_prompt_2_embed, negative_pooled_prompt_2_embed = _get_clip_prompt_embeds(
+    #         tokenizer=tokenizer,
+    #         tokenizer_2=tokenizer_2,
+    #         text_encoder=text_encoder,
+    #         text_encoder_2=text_encoder_2,
+    #         prompt=negative_prompt_2,
+    #         device=device,
+    #         num_images_per_prompt=num_images_per_prompt,
+    #         clip_skip=None,
+    #         clip_model_index=1,
+    #     )
+    #     negative_clip_prompt_embeds = torch.cat([negative_prompt_embed, negative_prompt_2_embed], dim=-1)
+
+    #     t5_negative_prompt_embed = _get_t5_prompt_embeds(
+    #         tokenizer_3=tokenizer_3,
+    #         text_encoder_3=text_encoder_3,
+    #         prompt=negative_prompt_3,
+    #         num_images_per_prompt=num_images_per_prompt,
+    #         max_sequence_length=max_sequence_length,
+    #         device=device,
+    #     )
+
+    #     negative_clip_prompt_embeds = torch.nn.functional.pad(
+    #         negative_clip_prompt_embeds,
+    #         (0, t5_negative_prompt_embed.shape[-1] - negative_clip_prompt_embeds.shape[-1]),
+    #     )
+
+    #     negative_prompt_embeds = torch.cat([negative_clip_prompt_embeds, t5_negative_prompt_embed], dim=-2)
+    #     negative_pooled_prompt_embeds = torch.cat(
+    #         [negative_pooled_prompt_embed, negative_pooled_prompt_2_embed], dim=-1
+    #     )
+    
+    negative_prompt_embeds = None
+    negative_pooled_prompt_embeds = None
+    return prompt_embeds, negative_prompt_embeds, pooled_prompt_embeds, negative_pooled_prompt_embeds
+
 
 def main(args):
     logging_dir = Path(args.output_dir, args.logging_dir)
@@ -535,7 +740,7 @@ def main(args):
     accelerator = Accelerator(
         gradient_accumulation_steps=args.gradient_accumulation_steps,
         mixed_precision=args.mixed_precision,
-        log_with=args.report_to,
+        # log_with=args.report_to,
         project_config=accelerator_project_config,
     )
 
@@ -567,38 +772,25 @@ def main(args):
                 repo_id=args.hub_model_id or Path(args.output_dir).name, exist_ok=True, token=args.hub_token
             ).repo_id
 
-
     # Load scheduler and models
-    noise_scheduler = DDPMScheduler.from_pretrained(args.pretrained_model_name_or_path, subfolder="scheduler", revision=args.revision)
-    image_encoder = CLIPVisionModelWithProjection.from_pretrained(args.pretrained_model_name_or_path, subfolder="image_encoder", revision=args.revision)
-    feature_extractor = None #CLIPFeatureExtractor.from_pretrained(args.pretrained_model_name_or_path, subfolder="feature_extractor", revision=args.revision)
-    vae = AutoencoderKL.from_pretrained(args.pretrained_model_name_or_path, subfolder="vae", revision=args.revision)
-    #TODO: change this to SD3DiT
-    unet = UNet2DConditionModel.from_pretrained(args.pretrained_model_name_or_path, subfolder="unet", revision=args.revision)
-
-    """
-    vae.train()
-    image_encoder.train()
+    noise_scheduler = FlowMatchEulerDiscreteScheduler.from_pretrained(args.pretrained_model_name_or_path, subfolder="scheduler", revision=args.revision, cache_dir=cache_dir)
+    text_encoder = CLIPTextModelWithProjection.from_pretrained(args.pretrained_model_name_or_path, subfolder="text_encoder", revision=args.revision, cache_dir=cache_dir)
+    tokenizer = CLIPTokenizer.from_pretrained(args.pretrained_model_name_or_path, subfolder="tokenizer", revision=args.revision, cache_dir=cache_dir)
+    text_encoder_2 = CLIPTextModelWithProjection.from_pretrained(args.pretrained_model_name_or_path, subfolder="text_encoder_2", revision=args.revision, cache_dir=cache_dir)
+    tokenizer_2 = CLIPTokenizer.from_pretrained(args.pretrained_model_name_or_path, subfolder="tokenizer_2", revision=args.revision, cache_dir=cache_dir)
+    text_encoder_3 = T5EncoderModel.from_pretrained(args.pretrained_model_name_or_path, subfolder="text_encoder_3", revision=args.revision, cache_dir=cache_dir)
+    tokenizer_3 = T5TokenizerFast.from_pretrained(args.pretrained_model_name_or_path, subfolder="tokenizer_3", revision=args.revision, cache_dir=cache_dir)
+    vae = AutoencoderKL.from_pretrained(args.pretrained_model_name_or_path, subfolder="vae", revision=args.revision, cache_dir=cache_dir)
+    dit = SD3Transformer2DModel.from_pretrained(args.pretrained_model_name_or_path, subfolder="transformer", revision=args.revision, cache_dir=cache_dir)
+    
+    text_encoder.requires_grad_(False)
     vae.requires_grad_(False)
-    image_encoder.requires_grad_(False)
-    # zero init unet conv_in from 4 channels to 8 channels
-    conv_in_8 = torch.nn.Conv2d(8, unet.conv_in.out_channels, kernel_size=unet.conv_in.kernel_size, padding=unet.conv_in.padding)
-    conv_in_8.requires_grad_(False)
-    unet.conv_in.requires_grad_(False)
-    torch.nn.init.zeros_(conv_in_8.weight)
-    conv_in_8.weight[:,:4,:,:].copy_(unet.conv_in.weight)
-    conv_in_8.bias.copy_(unet.conv_in.bias)
-    unet.conv_in = conv_in_8
-    unet.requires_grad_(True)
-    unet.train()
-    """
-
-    # Create EMA for the unet.
-    if args.use_ema:
-        ema_unet = EMAModel(unet.parameters(), model_cls=UNet2DConditionModel, model_config=unet.config)
+    
+    dit.requires_grad_(True)
+    dit.train()
 
     if args.gradient_checkpointing:
-        unet.enable_gradient_checkpointing()
+        dit.enable_gradient_checkpointing()
 
     # Check that all trainable models are in full precision
     low_precision_error_string = (
@@ -606,14 +798,9 @@ def main(args):
         " doing mixed precision training, copy of the weights should still be float32."
     )
 
-    if accelerator.unwrap_model(unet).dtype != torch.float32:
+    if accelerator.unwrap_model(dit).dtype != torch.float32:
         raise ValueError(
-            f"UNet loaded as datatype {accelerator.unwrap_model(unet).dtype}. {low_precision_error_string}"
-        )
-
-    if accelerator.unwrap_model(cc_projection).dtype != torch.float32:
-        raise ValueError(
-            f"UNet loaded as datatype {accelerator.unwrap_model(cc_projection).dtype}. {low_precision_error_string}"
+            f"DiT loaded as datatype {accelerator.unwrap_model(dit).dtype}. {low_precision_error_string}"
         )
 
     # Enable TF32 for faster training on Ampere GPUs,
@@ -641,8 +828,7 @@ def main(args):
 
     # Optimizer creation
     optimizer = optimizer_class(
-        [{"params": unet.parameters(), "lr": args.learning_rate},
-         {"params": cc_projection.parameters(), "lr": 10.*args.learning_rate}],
+        [{"params": dit.parameters(), "lr": args.learning_rate}],
         betas=(args.adam_beta1, args.adam_beta2),
         weight_decay=args.adam_weight_decay,
         eps=args.adam_epsilon
@@ -661,19 +847,36 @@ def main(args):
 
 
 
-    print_model_info(unet)
+    print_model_info(dit)
 
+    def tokenize_captions(examples, is_train=True):
+        captions = []
+        for caption in examples.text:
+            if isinstance(caption, str):
+                captions.append(caption)
+            elif isinstance(caption, (list, np.ndarray)):
+                # take a random caption if there are multiple
+                captions.append(random.choice(caption) if is_train else caption[0])
+            else:
+                raise ValueError(
+                    f"Caption column `text` should contain either strings or lists of strings."
+                )
+        inputs = tokenizer(
+            captions, max_length=tokenizer.model_max_length, padding="max_length", truncation=True, return_tensors="pt"
+        )
+        return inputs.input_ids
+    
+    def preprocess_train(examples):
+        examples["input_ids"] = tokenize_captions(examples)
+        return examples
 
-    # Init Dataset
-    image_transforms = torchvision.transforms.Compose(
-        [
-            torchvision.transforms.Resize((args.resolution, args.resolution)),  # 256, 256
-            transforms.ToTensor(),
-            transforms.Normalize([0.5], [0.5])
-        ]
-    )
-    train_dataset = ObjaverseData(root_dir=args.train_data_dir, image_transforms=image_transforms, validation=False)
-    validation_dataset = ObjaverseData(root_dir=args.train_data_dir, image_transforms=image_transforms, validation=True)
+    train_dataset = TextImageDataset(args.train_data_dir, height=args.resolution, width=args.resolution)
+    validation_dataset = TextImageDataset(args.train_data_dir, height=args.resolution, width=args.resolution)
+    
+    with accelerator.main_process_first():
+        train_dataset = preprocess_train(train_dataset)
+        validation_dataset = preprocess_train(validation_dataset)
+    
     # for training
     train_dataloader = torch.utils.data.DataLoader(
         train_dataset,
@@ -713,12 +916,12 @@ def main(args):
     )
 
     # Prepare everything with our `accelerator`.
-    unet, cc_projection, optimizer, train_dataloader, validation_dataloader, train_log_dataloader, lr_scheduler = accelerator.prepare(
-        unet, cc_projection, optimizer, train_dataloader, validation_dataloader, train_log_dataloader, lr_scheduler
+    dit, optimizer, train_dataloader, validation_dataloader, train_log_dataloader, lr_scheduler = accelerator.prepare(
+        dit, optimizer, train_dataloader, validation_dataloader, train_log_dataloader, lr_scheduler
     )
 
-    if args.use_ema:
-        ema_unet.to(accelerator.device)
+    # if args.use_ema:
+    #     ema_unet.to(accelerator.device)
 
     # For mixed precision training we cast the text_encoder and vae weights to half-precision
     # as these models are only used for inference, keeping weights in full precision is not required.
@@ -730,7 +933,6 @@ def main(args):
 
     # Move vae, image_encoder to device and cast to weight_dtype
     vae.to(accelerator.device, dtype=weight_dtype)
-    image_encoder.to(accelerator.device, dtype=weight_dtype)
 
     # We need to recalculate our total training steps as the size of the training dataloader may have changed.
     num_update_steps_per_epoch = math.ceil(len(train_dataloader) / args.gradient_accumulation_steps)
@@ -801,11 +1003,10 @@ def main(args):
         loss_epoch = 0.0
         num_train_elems = 0
         for step, batch in enumerate(train_dataloader):
-            with accelerator.accumulate(unet, cc_projection):
+            with accelerator.accumulate(dit):
                 # Convert images to latent space
-                gt_image = batch["image_target"].to(dtype=weight_dtype)
-                input_image = batch["image_cond"].to(dtype=weight_dtype)
-                pose = batch["T"].to(dtype=weight_dtype)
+                gt_image = batch["image"].to(dtype=weight_dtype)
+                input_image = batch["image"].to(dtype=weight_dtype)
 
                 gt_latents = vae.encode(gt_image).latent_dist.sample().detach()
                 gt_latents = gt_latents * vae.config.scaling_factor # follow zero123, only target image latent is scaled
@@ -815,78 +1016,67 @@ def main(args):
                 # Sample noise that we'll add to the latents
                 noise = torch.randn_like(gt_latents)
                 bsz = gt_latents.shape[0]
+                
                 # Sample a random timestep for each image
-                timesteps = torch.randint(0, noise_scheduler.config.num_train_timesteps, (bsz,), device=gt_latents.device)
-                timesteps = timesteps.long()
-
+                # timesteps = torch.randint(0, noise_scheduler.config.num_train_timesteps, (bsz,), device=gt_latents.device)
+                # timesteps = timesteps.long()
+                    
+                timestep_idx = random.randint(0, noise_scheduler.config.num_train_timesteps - 1)
+                timesteps = noise_scheduler.timesteps[timestep_idx]
+                timesteps = timesteps.unsqueeze(0)
+                
                 # Add noise to the latents according to the noise magnitude at each timestep
                 # (this is the forward diffusion process)
-                noisy_latents = noise_scheduler.add_noise(gt_latents.to(dtype=torch.float32), noise.to(dtype=torch.float32), timesteps).to(dtype=img_latents.dtype)
-
-                if do_classifier_free_guidance:  #support classifier-free guidance, randomly drop out 5%
-                    # Conditioning dropout to support classifier-free guidance during inference. For more details
-                    # check out the section 3.2.1 of the original paper https://arxiv.org/abs/2211.09800.
-                    random_p = torch.rand(bsz, device=gt_latents.device)
-                    # Sample masks for the edit prompts.
-                    prompt_mask = random_p < 2 * args.conditioning_dropout_prob
-                    prompt_mask = prompt_mask.reshape(bsz, 1, 1)
-
-                    img_prompt_embeds = _encode_image(image_encoder, input_image, gt_latents.device, gt_latents.dtype, False)
-                    pose_prompt_embeds = _encode_pose(pose, gt_latents.device, gt_latents.dtype, False)
-
-                    # Final text conditioning.
-                    null_conditioning = torch.zeros_like(img_prompt_embeds).detach()
-                    img_prompt_embeds = torch.where(prompt_mask, null_conditioning, img_prompt_embeds)
-
-                    prompt_embeds = torch.cat([img_prompt_embeds, pose_prompt_embeds], dim=-1)
-                    prompt_embeds = cc_projection(prompt_embeds)
-
-                    # Sample masks for the input images.
-                    image_mask_dtype = img_latents.dtype
-                    image_mask = 1 - (
-                            (random_p >= args.conditioning_dropout_prob).to(image_mask_dtype)
-                            * (random_p < 3 * args.conditioning_dropout_prob).to(image_mask_dtype)
-                    )
-                    image_mask = image_mask.reshape(bsz, 1, 1, 1)
-                    # Final image conditioning.
-                    img_latents = image_mask * img_latents
-                else:
-                    # Get the image_with_pose embedding for conditioning
-                    prompt_embeds = _encode_image_with_pose(image_encoder, cc_projection, input_image, pose, gt_latents.device, weight_dtype, False)
-
-
-                latent_model_input = torch.cat([noisy_latents, img_latents], dim=1)
-
-                # Predict the noise residual
-                model_pred = unet(
-                    latent_model_input,
+                                
+                noisy_latents = noise_scheduler.scale_noise(
+                    gt_latents.to(dtype=torch.float32),
                     timesteps,
-                    encoder_hidden_states=prompt_embeds,
-                ).sample
+                    noise.to(dtype=torch.float32),
+                ).to(dtype=img_latents.dtype)
 
-                # Get the target for loss depending on the prediction type
-                if noise_scheduler.config.prediction_type == "epsilon":
-                    target = noise
-                elif noise_scheduler.config.prediction_type == "v_prediction":
-                    target = noise_scheduler.get_velocity(gt_latents, noise, timesteps)
-                else:
-                    raise ValueError(f"Unknown prediction type {noise_scheduler.config.prediction_type}")
+                
+                prompt_embeds, negative_prompt_embeds, pooled_prompt_embeds, negative_pooled_prompt_embeds = encode_prompt(
+                    tokenizer=tokenizer,
+                    tokenizer_2=tokenizer_2,
+                    tokenizer_3=tokenizer_3,
+                    text_encoder=text_encoder,
+                    text_encoder_2=text_encoder_2,
+                    text_encoder_3=text_encoder_3,
+                    prompt=batch["text"],
+                    prompt_2=batch["text"],
+                    prompt_3=batch["text"],
+                )
+                
+                # Predict the noise residual
+                model_pred = dit(
+                    noisy_latents,
+                    encoder_hidden_states=prompt_embeds,
+                    pooled_projections=pooled_prompt_embeds,
+                    timestep=timesteps.to(accelerator.device),
+                ).sample
+                
+                # # Get the target for loss depending on the prediction type
+                # if noise_scheduler.config.prediction_type == "epsilon":
+                #     target = noise
+                # elif noise_scheduler.config.prediction_type == "v_prediction":
+                #     target = noise_scheduler.get_velocity(gt_latents, noise, timesteps)
+                # else:
+                #     raise ValueError(f"Unknown prediction type {noise_scheduler.config.prediction_type}")
+
+                target = noise
 
                 loss = F.mse_loss(model_pred.float(), target.float(), reduction="none")
                 loss = (loss.mean([1, 2, 3])).mean()
 
                 accelerator.backward(loss)
-                # if accelerator.sync_gradients:
-                #     params_to_clip = (itertools.chain(unet.parameters(), cc_projection.parameters()))
-                #     accelerator.clip_grad_norm_(params_to_clip, args.max_grad_norm)
                 optimizer.step()
                 lr_scheduler.step()
                 optimizer.zero_grad(set_to_none=args.set_grads_to_none)
 
+                del noise, noisy_latents, encoder_hidden_states, model_pred, target
+
             # Checks if the accelerator has performed an optimization step behind the scenes
             if accelerator.sync_gradients:
-                if args.use_ema:
-                    ema_unet.step(unet.parameters())
                 progress_bar.update(1)
                 global_step += 1
 
@@ -916,46 +1106,32 @@ def main(args):
                         accelerator.save_state(save_path)
                         logger.info(f"Saved state to {save_path}")
 
-                    if validation_dataloader is not None and global_step % args.validation_steps == 0:
-                        if args.use_ema:
-                            # Store the UNet parameters temporarily and load the EMA parameters to perform inference.
-                            ema_unet.store(unet.parameters())
-                            ema_unet.copy_to(unet.parameters())
-                        image_logs = log_validation(
-                            validation_dataloader,
-                            vae,
-                            image_encoder,
-                            feature_extractor,
-                            unet,
-                            cc_projection,
-                            args,
-                            accelerator,
-                            weight_dtype,
-                            'val',
-                        )
-                        if args.use_ema:
-                            # Switch back to the original UNet parameters.
-                            ema_unet.restore(unet.parameters())
-                    if train_log_dataloader is not None and (global_step % args.validation_steps == 0 or global_step == 1):
-                        if args.use_ema:
-                            # Store the UNet parameters temporarily and load the EMA parameters to perform inference.
-                            ema_unet.store(unet.parameters())
-                            ema_unet.copy_to(unet.parameters())
-                        train_image_logs = log_validation(
-                            train_log_dataloader,
-                            vae,
-                            image_encoder,
-                            feature_extractor,
-                            unet,
-                            cc_projection,
-                            args,
-                            accelerator,
-                            weight_dtype,
-                            'train',
-                        )
-                        if args.use_ema:
-                            # Switch back to the original UNet parameters.
-                            ema_unet.restore(unet.parameters())
+                    # if validation_dataloader is not None and global_step % args.validation_steps == 0:
+                    #     image_logs = log_validation(
+                    #         validation_dataloader,
+                    #         vae,
+                    #         text_encoder,
+                    #         tokenizer,
+                    #         dit,
+                    #         args,
+                    #         accelerator,
+                    #         weight_dtype,
+                    #         'val',
+                    #     )
+                    # if train_log_dataloader is not None and (global_step % args.validation_steps == 0 or global_step == 1):
+                    #     train_image_logs = log_validation(
+                    #         train_log_dataloader,
+                    #         vae,
+                    #         text_encoder,
+                    #         tokenizer,
+                    #         dit,
+                    #         args,
+                    #         accelerator,
+                    #         weight_dtype,
+                    #         epoch,
+                    #         'train',
+                    #     )
+
             loss_epoch += loss.detach().item()
             num_train_elems += 1
             logs = {"loss": loss.detach().item(), "lr": lr_scheduler.get_last_lr()[0], "loss_epoch": loss_epoch/num_train_elems,
@@ -969,23 +1145,15 @@ def main(args):
     # Create the pipeline using using the trained modules and save it.
     accelerator.wait_for_everyone()
     if accelerator.is_main_process:
-        unet = accelerator.unwrap_model(unet)
-        if args.use_ema:
-            ema_unet.copy_to(unet.parameters())
-        # unet.save_pretrained(args.output_dir)
-        # cc_projection = accelerator.unwrap_model(cc_projection)
-        # cc_projection.save_pretrained(args.output_dir)
-
-        pipeline = Zero1to3StableDiffusionPipeline.from_pretrained(
+        dit = accelerator.unwrap_model(dit)
+        pipeline = StableDiffusion3Pipeline.from_pretrained(
             args.pretrained_model_name_or_path,
             vae=accelerator.unwrap_model(vae),
-            image_encoder=accelerator.unwrap_model(image_encoder),
-            feature_extractor=feature_extractor,
-            unet=unet,
-            cc_projection=accelerator.unwrap_model(cc_projection),
+            dit=dit,
             scheduler=noise_scheduler,
             safety_checker=None,
             torch_dtype=torch.float32,
+            cache_dir=cache_dir
         )
         pipeline.save_pretrained(args.output_dir)
 
