@@ -13,7 +13,7 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 
-cache_dir="/ocean/projects/cis250002p/rju/huggingface/hub"
+cache_dir="/ocean/projects/cis240022p/ylitman/data/hub"
 
 
 import argparse
@@ -62,7 +62,7 @@ from diffusers.utils.import_utils import is_xformers_available
 from diffusers.training_utils import EMAModel
 
 # from dataset import ObjaverseDataLoader, ObjaverseData
-from diffsynth.data.data_utils import DatasetTextAndEnvmapToImage, TextImageDataset
+from diffsynth.data.data_utils import DatasetTextAndEnvmapToImage#, TextImageDataset
 from diffsynth.models.sd3_dit import SD3DiT
 # from diffsynth.models.sd3_image import SD3ImagePipeline
 
@@ -182,8 +182,7 @@ def parse_args(input_args=None):
     parser.add_argument(
         "--pretrained_model_name_or_path",
         type=str,
-        default="lambdalabs/sd-image-variations-diffusers",
-        required=True,
+        default="stabilityai/stable-diffusion-3.5-medium",
         help="Path to pretrained model or model identifier from huggingface.co/models.",
     )
     parser.add_argument(
@@ -199,7 +198,7 @@ def parse_args(input_args=None):
     parser.add_argument(
         "--output_dir",
         type=str,
-        default="zero123-model",
+        default="models",
         help="The output directory where the model predictions and checkpoints will be written.",
     )
     parser.add_argument("--seed", type=int, default=42, help="A seed for reproducible training.")
@@ -397,6 +396,12 @@ def parse_args(input_args=None):
         help="The config of the Dataset, leave as None if there's only one config.",
     )
     parser.add_argument(
+        "--envmap_path",
+        type=str,
+        default=None,
+        help="Environment map path.",
+    )
+    parser.add_argument(
         "--train_data_dir",
         type=str,
         default=None,
@@ -423,6 +428,11 @@ def parse_args(input_args=None):
             " `args.validation_prompt` multiple times: `args.num_validation_images`"
             " and logging the images."
         ),
+    )
+    parser.add_argument(
+        "--validation_prompts",
+        nargs='+',
+        default=[]
     )
     parser.add_argument(
         "--num_validation_batches",
@@ -831,7 +841,8 @@ def main(args):
         [{"params": dit.parameters(), "lr": args.learning_rate}],
         betas=(args.adam_beta1, args.adam_beta2),
         weight_decay=args.adam_weight_decay,
-        eps=args.adam_epsilon
+        eps=args.adam_epsilon,
+        is_paged=True
     )
 
     # print model info, learnable parameters, non-learnable parameters, total parameters, model size, all in billion
@@ -870,12 +881,12 @@ def main(args):
         examples["input_ids"] = tokenize_captions(examples)
         return examples
 
-    train_dataset = TextImageDataset(args.train_data_dir, height=args.resolution, width=args.resolution)
-    validation_dataset = TextImageDataset(args.train_data_dir, height=args.resolution, width=args.resolution)
+    train_dataset = DatasetTextAndEnvmapToImage(args.train_data_dir, args.envmap_path, height=args.resolution, width=args.resolution)
+    validation_dataset = DatasetTextAndEnvmapToImage(args.train_data_dir, args.envmap_path, height=args.resolution, width=args.resolution)
     
-    with accelerator.main_process_first():
-        train_dataset = preprocess_train(train_dataset)
-        validation_dataset = preprocess_train(validation_dataset)
+    # with accelerator.main_process_first():
+    #     train_dataset = preprocess_train(train_dataset)
+    #     validation_dataset = preprocess_train(validation_dataset)
     
     # for training
     train_dataloader = torch.utils.data.DataLoader(
@@ -1048,6 +1059,10 @@ def main(args):
                 )
                 
                 # Predict the noise residual
+                prompt_embeds = prompt_embeds.to(accelerator.device)
+                pooled_prompt_embeds = pooled_prompt_embeds.to(accelerator.device)
+                timesteps = timesteps.to(accelerator.device)
+
                 model_pred = dit(
                     noisy_latents,
                     encoder_hidden_states=prompt_embeds,

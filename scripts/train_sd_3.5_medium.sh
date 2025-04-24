@@ -4,22 +4,14 @@ DATASET_ROOT=/ocean/projects/cis240058p/jzhang24/yehonathan_temp
 START_TIME=$(date +%s)
 START_DATETIME=$(date "+%Y-%m-%d %H:%M:%S")
 
-python examples/train/stable_diffusion_3/train_sd3.py \
-  --pretrained_path ${MODEL_PATH_ROOT}/text_encoders/clip_g.safetensors,${MODEL_PATH_ROOT}/text_encoders/clip_l.safetensors,${MODEL_PATH_ROOT}/text_encoders/clip_g.safetensors,${MODEL_PATH_ROOT}/text_encoders/t5xxl_fp16.safetensors,${MODEL_PATH_ROOT}/sd3.5_medium.safetensors \
-  --dataset_path ${DATASET_ROOT}/material_anything_from_60000/train \
-  --dataset_config_path ${DATASET_ROOT}/material_anything_from_60000/transforms_train.json \
+python3 examples/train/stable_diffusion_3/train_sd3.py \
+  --train_data_dir ${DATASET_ROOT}/material_anything_from_60000/transforms_train.json \
   --envmap_path ${DATASET_ROOT}/laval_haven \
-  --output_path ./models \
-  --max_epochs 20 \
-  --steps_per_epoch 1000 \
-  --height 256 \
-  --width 256 \
-  --batch_size 1 \
-  --log_every_n_steps 1 \
-  --center_crop \
-  --precision "16-mixed" \
+  --num_train_epochs 20 \
+  --resolution 256 \
+  --train_batch_size 4 \
+  --mixed_precision "fp16" \
   --learning_rate 1e-20 \
-  --use_gradient_checkpointing \
   --validation_prompts "an old-fashioned bow and arrow" \
   --use_8bit_adam
   # --use_wandb
